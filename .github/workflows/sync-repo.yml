@@ -50,8 +50,8 @@ jobs:
     permissions:
       contents: write
     env:
-      FORK_BRANCHES_FILE: ${{ env.METADATA_DIR }}/fork-created-branches.txt
-      FORK_TAGS_FILE: ${{ env.METADATA_DIR }}/fork-created-tags.json
+      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
+      FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
     outputs:
       origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
     steps:
