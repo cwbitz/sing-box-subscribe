@@ -118,8 +118,8 @@ jobs:
 
           git sparse-checkout set --no-cone --stdin <<EOF
           /*
-          !$WORKFLOW_DIR
-          !$METADATA_DIR
+          !.github/workflows/
+          !.github/sync-metadata/
           EOF
 
           echo "Syncing branches from upstream..."
