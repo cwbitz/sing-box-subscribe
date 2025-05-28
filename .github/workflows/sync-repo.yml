@@ -82,6 +82,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Initialize sparse-checkout
+          git sparse-checkout init --no-cone
+          
+          # Set sparse-checkout patterns
+          git sparse-checkout set \
+            '*' \
+            '!/.github/workflows/' \
+            '!/.github/sync-metadata/'
+
           git fetch upstream --tags
           git fetch origin --tags
 
@@ -115,15 +124,6 @@ jobs:
               fi
             fi
           done
-
-          # Initialize sparse-checkout
-          git sparse-checkout init --no-cone
-          
-          # Set sparse-checkout patterns
-          git sparse-checkout set \
-            '*' \
-            '!/.github/workflows/' \
-            '!/.github/sync-metadata/'
           
           echo "Syncing branches from upstream..."
           conflicts=()
