@@ -116,7 +116,7 @@ jobs:
             fi
           done
 
-          git sparse-checkout set --no-cone --stdin <<"EOF"
+          git sparse-checkout set --no-cone --stdin <<EOF
           /*
           !$WORKFLOW_DIR
           !$METADATA_DIR
