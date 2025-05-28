@@ -116,10 +116,15 @@ jobs:
             fi
           done
 
-          git sparse-checkout set --no-cone --stdin <<EOF
+          # Initialize sparse-checkout properly
+          git sparse-checkout init
+          git config core.sparseCheckout true
+          
+          # Create sparse-checkout file directly
+          cat > .git/info/sparse-checkout <<'EOF'
           /*
-          !.github/workflows/
-          !.github/sync-metadata/
+          !.github/workflows/*
+          !.github/sync-metadata/*
           EOF
 
           echo "Syncing branches from upstream..."
