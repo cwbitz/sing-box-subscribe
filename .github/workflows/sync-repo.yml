@@ -116,17 +116,15 @@ jobs:
             fi
           done
 
-          # Initialize sparse-checkout properly
-          git sparse-checkout init
-          git config core.sparseCheckout true
+          # Initialize sparse-checkout
+          git sparse-checkout init --no-cone
           
-          # Create sparse-checkout file directly
-          cat > .git/info/sparse-checkout <<'EOF'
-          /*
-          !.github/workflows/*
-          !.github/sync-metadata/*
-          EOF
-
+          # Set sparse-checkout patterns
+          git sparse-checkout set \
+            '*' \
+            '!/.github/workflows/' \
+            '!/.github/sync-metadata/'
+          
           echo "Syncing branches from upstream..."
           conflicts=()
           for upstream_branch in "${upstream_branches[@]}"; do
