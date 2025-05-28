@@ -160,7 +160,7 @@ jobs:
               page=1
               while :; do
                 response=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
-                  "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}/versions?per_page=100&page=$page")
+                  "${{ steps.check-registry.outputs.GHCR_URL_BASE }}/packages/container/${{ github.event.repository.name }}/versions?per_page=100&page=$page")
                 
                 mapfile -t page_tags < <(echo "$response" | jq -r '.[].metadata.container.tags[]? // empty')
                 [[ ${#page_tags[@]} -eq 0 ]] && break
