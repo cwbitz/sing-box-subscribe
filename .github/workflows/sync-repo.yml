@@ -106,7 +106,7 @@ jobs:
 
           echo "Detecting upstream-deleted branches to prune..."
           for origin_branch in "${origin_branches[@]}"; do
-            if ! echo "$upstream_branches" | grep -Fxq "$origin_branch"; then
+            if ! printf '%s\n' "${upstream_branches[@]}" | grep -Fxq "$origin_branch"; then
               if is_fork_created_branch "$origin_branch"; then
                 echo "Skipping fork-created branch $origin_branch..."
               else
