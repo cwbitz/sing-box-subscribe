@@ -79,8 +79,6 @@ jobs:
         id: sync-branches-and-tags
         env:
           UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
-          UPSTREAM_BRANCHES: ${{ needs.collect-metadata.outputs.upstream_branches }}
-          ORIGIN_BRANCHES: ${{ needs.collect-metadata.outputs.origin_branches }}
         run: |
           set -euo pipefail
 
