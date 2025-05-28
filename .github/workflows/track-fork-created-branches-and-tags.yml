@@ -1,0 +1,118 @@
+name: Track Fork-Created Branches and Tags
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+
+env:
+  METADATA_DIR: .github/sync-metadata
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    env:
+      FORK_BRANCHES_FILE: ${{ env.METADATA_DIR }}/fork-created-branches.txt
+      FORK_TAGS_FILE: ${{ env.METADATA_DIR }}/fork-created-tags.json
+    if: github.actor == github.repository_owner
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Ref Type and Name
+        id: detect-ref
+        run: |
+          case "${GITHUB_REF}" in
+            refs/heads/*)
+              echo "ref_type=branch" >> "$GITHUB_OUTPUT"
+              echo "ref_name=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+              ;;
+            refs/tags/*)
+              echo "ref_type=tag" >> "$GITHUB_OUTPUT"
+              echo "ref_name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Ensure Metadata Directory Exists
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "$METADATA_DIR" ]]; then
+            echo "Metadata directory does not exist. Creating $METADATA_DIR..."
+            mkdir -p "$METADATA_DIR"
+          else
+            echo "Metadata directory already exists: $METADATA_DIR."
+          fi
+
+      - name: Update Tracking Files
+        env:
+          REF_TYPE: ${{ steps.detect-ref.outputs.ref_type }}
+          REF_NAME: ${{ steps.detect-ref.outputs.ref_name }}
+        run: |
+          set -euo pipefail
+
+          case "$REF_TYPE" in
+            "branch")
+              touch "$FORK_BRANCHES_FILE"
+              if ! grep -Fxq "$REF_NAME" "$FORK_BRANCHES_FILE"; then
+                echo "$REF_NAME" >> "$FORK_BRANCHES_FILE"
+                echo "added=true" >> "$GITHUB_ENV"
+              else
+                echo "Ref name already recorded."
+                echo "added=false" >> "$GITHUB_ENV"
+              fi
+              ;;
+            "tag")
+              if [[ ! -s "$FORK_TAGS_FILE" ]]; then
+                echo '[]' > "$FORK_TAGS_FILE"
+              fi
+
+              TAG_COMMIT=$(git rev-list -n 1 "$REF_NAME")
+              SOURCE_BRANCH=$(git for-each-ref --points-at "$TAG_COMMIT" --format='%(refname:short)' refs/heads/ | head -n1)
+              
+              if [[ -n "$SOURCE_BRANCH" ]] && grep -Fxq "$SOURCE_BRANCH" "$FORK_BRANCHES_FILE"; then
+                TAG_DATE=$(git show -s --format=%ci "$TAG_COMMIT")
+                TAG_AUTHOR=$(git show -s --format='%an <%ae>' "$TAG_COMMIT")
+                NEW_ENTRY=$(jq -nc \
+                  --arg name "$REF_NAME" \
+                  --arg branch "$SOURCE_BRANCH" \
+                  --arg commit "$TAG_COMMIT" \
+                  --arg date "$TAG_DATE" \
+                  --arg author "$TAG_AUTHOR" \
+                  '{name: $name, branch: $branch, commit: $commit, date: $date, author: $author}')
+
+                if ! jq -e --arg name "$REF_NAME" '.[] | select(.name == $name)' "$FORK_TAGS_FILE" > /dev/null; then
+                  jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_TAGS_FILE" > "${FORK_TAGS_FILE}.tmp"
+                  mv "${FORK_TAGS_FILE}.tmp" "$FORK_TAGS_FILE"
+                  echo "added=true" >> "$GITHUB_ENV"
+                else
+                  echo "Tag entry already recorded."
+                  echo "added=false" >> "$GITHUB_ENV"
+                fi
+              else
+                echo "Tag is not on a fork-created branch, skipping..."
+                echo "added=false" >> "$GITHUB_ENV"
+              fi
+              ;;
+          esac
+
+      - name: Commit and Push New Ref
+        if: env.added == 'true'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add "$METADATA_DIR/fork-created-*.json"
+
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: Track fork-created ${{ steps.detect-ref.outputs.ref_type }}: ${{ steps.detect-ref.outputs.ref_name }}"       
+            git push origin HEAD:${{ steps.detect-ref.outputs.ref_name }}
+          else
+            echo "No changes to commit"
+          fi

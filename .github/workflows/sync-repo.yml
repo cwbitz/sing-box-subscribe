@@ -5,203 +5,198 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
+env:
+  WORKFLOW_DIR: .github/workflows/
+  METADATA_DIR: .github/sync-metadata/
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  retrieve-info:
-    name: Retrieve Repo Info
+  collect-metadata:
+    name: Collect Repository Metadata
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      REPO_FULL_NAME: ${{ github.repository }}
     outputs:
-      upstream_full_name: ${{ steps.upstream-info.outputs.UPSTREAM_FULL_NAME }}
-      upstream_default_branch: ${{ steps.upstream-info.outputs.UPSTREAM_DEFAULT_BRANCH }}
-      upstream_branches: ${{ steps.get-branches.outputs.UPSTREAM_BRANCHES }}
-      is_fork: ${{ steps.check-fork.outputs.IS_FORK }}
+      upstream_full_name: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_FULL_NAME }}
+      upstream_url: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_URL }}
+      upstream_default_branch: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_DEFAULT_BRANCH }}
     steps:
-      - name: Check if Repository is a Fork
-        id: check-fork
+      - name: Collect Upstream and Origin Repository Metadata
+        id: collect-repo-metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Checking if repository is a fork..."
-          response=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO_FULL_NAME")
-          
-          if [ -z "$response" ]; then
-            echo "Failed to retrieve repository information."
-            echo "IS_FORK=false" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          
-          if echo "$response" | jq -e '.fork == true' >/dev/null; then
-            echo "This repository is a fork."
-            echo "IS_FORK=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          echo "Fetching repository metadata via Github API..."
+          response=$(curl -sf -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}")
+
+          if echo "$response" | jq -e '.fork == true'; then
+            echo "This repository is a fork. Fetching metadata..."
+            echo "UPSTREAM_FULL_NAME=$(echo "$response" | jq -re '.parent.full_name')" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_DEFAULT_BRANCH=$(echo "$response" | jq -re '.parent.default_branch')" >> "$GITHUB_OUTPUT"
           else
             echo "This repository is not a fork."
-            echo "IS_FORK=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Retrieve Upstream Repo Info
-        id: upstream-info
-        if: steps.check-fork.outputs.IS_FORK == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          response=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO_FULL_NAME")
-          echo "Fetching repository information via Github API..."
-
-          if [ -z "$response" ]; then
-            echo "Failed to retrieve repository information."
-            exit 1
-          fi
-
-          if ! echo "$response" | jq -e '.parent' >/dev/null; then
-            echo "This repository is a fork but parent information is missing."
-            exit 1
-          fi
-
-          name=$(echo "$response" | jq -r '.parent.name')
-          echo "UPSTREAM_REPO=$name" >> "$GITHUB_ENV"
-
-          html_url=$(echo "$response" | jq -r '.parent.html_url')
-          echo "UPSTREAM_REPO_URL=$html_url" >> "$GITHUB_ENV"
-
-          full_name=$(echo "$response" | jq -r '.parent.full_name')
-          echo "UPSTREAM_FULL_NAME=$full_name" >> "$GITHUB_OUTPUT"
-
-          default_branch=$(echo "$response" | jq -r '.parent.default_branch')
-          echo "UPSTREAM_DEFAULT_BRANCH=$default_branch" >> "$GITHUB_OUTPUT"
-
-      - name: Retrieve Upstream Branches
-        id: get-branches
-        if: steps.check-fork.outputs.IS_FORK == 'true'
-        env:
-          UPSTREAM_REPO_URL: ${{ env.UPSTREAM_REPO_URL }}
-        run: |
-          if [ -z "$UPSTREAM_REPO_URL" ]; then
-            echo "Upstream repository URL is empty. Exiting..."
-            echo "UPSTREAM_BRANCHES=[]" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          
-          branches=$(git ls-remote --heads "$UPSTREAM_REPO_URL" | awk '{print $2}' | sed -E 's|refs/heads/||g' | tr -d '[:cntrl:]')
-          echo "Fetching branches from upstream repository..."
-
-          if [[ -z "$branches" ]]; then
-            echo "No branches found! Setting empty array to avoid workflow failure."
-            echo "UPSTREAM_BRANCHES=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Ensure valid JSON array format
-          branches_json=$(echo "$branches" | jq -Rcs 'split("\n") | map(select(length > 0))')
-          echo "Upstream branches JSON array: $branches_json"
-          echo "UPSTREAM_BRANCHES=$branches_json" >> "$GITHUB_OUTPUT"
-
-  collect-tags:
-    name: Collect Repository Tags
-    runs-on: ubuntu-latest
-    needs: retrieve-info
-    permissions:
-      contents: read
-    outputs:
-      repo_tags: ${{ steps.fetch-tags.outputs.REPO_TAGS }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fetch Tags From Upstream
-        id: fetch-tags
-        env:
-          UPSTREAM_URL: https://github.com/${{ needs.retrieve-info.outputs.upstream_full_name }}.git
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-
-          if ! git remote get-url upstream &> /dev/null; then
-            git remote add upstream "$UPSTREAM_URL"
-          fi
-
-          git fetch --tags upstream || { echo "Failed to fetch tags"; exit 1; }
-          tags=$(git tag -l)
-          
-          if [ -z "$tags" ]; then
-            echo "No tags found in upstream repository."
-            echo "ALL_TAGS=[]" >> "$GITHUB_OUTPUT"
-          else
-            tags_json=$(git tag --sort=creatordate | jq -R . | jq -cs .)
-            echo "REPO_TAGS=$tags_json" >> "$GITHUB_OUTPUT"
           fi
 
   sync-fork:
-    name: Sync Forked Repo
+    name: Sync Forked Repository
     runs-on: ubuntu-latest
-    needs: [retrieve-info, collect-tags]
+    needs: [collect-metadata]
     permissions:
       contents: write
-    strategy:
-      matrix:
-        branches: ${{ fromJson(needs.retrieve-info.outputs.UPSTREAM_BRANCHES) }}
+    env:
+      FORK_BRANCHES_FILE: ${{ env.METADATA_DIR }}/fork-created-branches.txt
+      FORK_TAGS_FILE: ${{ env.METADATA_DIR }}/fork-created-tags.json
+    outputs:
+      origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync Branch and Push
+      - name: Configure Git and Upstream Remote
         env:
-          UPSTREAM_URL: https://github.com/${{ needs.retrieve-info.outputs.upstream_full_name }}.git
-          UPSTREAM_BRANCHES: ${{ matrix.branches }}
+          UPSTREAM_URL: ${{ needs.collect-metadata.outputs.upstream_url }}
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if ! git remote get-url upstream &> /dev/null; then
             git remote add upstream "$UPSTREAM_URL"
+          else
+            git remote set-url upstream "$UPSTREAM_URL"
           fi
 
-          git sparse-checkout set --no-cone --stdin <<EOF
+      - name: Sync Branches and Tags
+        id: sync-branches-and-tags
+        env:
+          UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
+          UPSTREAM_BRANCHES: ${{ needs.collect-metadata.outputs.upstream_branches }}
+          ORIGIN_BRANCHES: ${{ needs.collect-metadata.outputs.origin_branches }}
+        run: |
+          set -euo pipefail
+
+          git fetch upstream --tags
+          git fetch origin --tags
+
+          # Prune and Sync Branches
+          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/)
+          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+
+          if [[ -s "$FORK_BRANCHES_FILE" ]]; then
+            mapfile -t fork_branches < "$FORK_BRANCHES_FILE"
+          else
+            fork_branches=()
+          fi
+
+          is_fork_created_branch() {
+            local branch=$1
+            for fork_branch in "${fork_branches[@]}"; do
+              [[ -z "$fork_branch" ]] && continue
+              [[ "$branch" == "$fork_branch" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Detecting upstream-deleted branches to prune..."
+          for origin_branch in "${origin_branches[@]}"; do
+            if ! echo "$upstream_branches" | grep -Fxq "$origin_branch"; then
+              if is_fork_created_branch "$origin_branch"; then
+                echo "Skipping fork-created branch $origin_branch..."
+              else
+                echo "Pruning upstream-deleted branch $origin_branch from origin..."
+                git push origin --delete "$origin_branch"
+              fi
+            fi
+          done
+
+          git sparse-checkout set --no-cone --stdin <<"EOF"
           /*
-          !.github/workflows/
+          !$WORKFLOW_DIR
+          !$METADATA_DIR
           EOF
 
-          if git show-ref --verify --quiet "refs/heads/$UPSTREAM_BRANCHES"; then
-            git checkout "$UPSTREAM_BRANCHES"
-          else
-            git checkout -b "$UPSTREAM_BRANCHES" "upstream/$UPSTREAM_BRANCHES"
+          echo "Syncing branches from upstream..."
+          conflicts=()
+          for upstream_branch in "${upstream_branches[@]}"; do
+            if is_fork_created_branch "$upstream_branch"; then
+              echo "Conflict detected: Branch '$upstream_branch' exists in both upstream and fork-created branches!"
+              conflicts+=("$upstream_branch")
+            fi
+          done
+
+          if [ ${#conflicts[@]} -gt 0 ]; then
+            echo "Sync halted due to branch name conflicts!"
+            echo "The following branches exist in both upstream and fork-created branches:"
+            printf '%s\n' "${conflicts[@]}"
+            echo "Please resolve these conflicts manually and update the fork-created-branches.txt file accordingly."
+            exit 1
           fi
 
-          git pull --rebase upstream "$UPSTREAM_BRANCHES"
-          git push origin "$UPSTREAM_BRANCHES"
+          for upstream_branch in "${upstream_branches[@]}"; do
+            echo "Syncing upstream branch: $upstream_branch..."
+            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"
+            git reset --hard "upstream/$upstream_branch"
+            git push --force origin "$upstream_branch"
+          done
           
-      - name: Push Tags
-        if: ${{ matrix.branches == needs.retrieve-info.outputs.upstream_default_branch }}
-        run: |
-          # Only push tags once on the default branch iteration
-          tag_count=$(git tag -l | wc -l)
-          if [ "$tag_count" -gt 0 ]; then
-            git push origin --tags
+          # Prune and Sync Tags
+          mapfile -t upstream_tags < <(git tag -l --sort=creatordate)
+          mapfile -t origin_tags < <(git tag -l --sort=creatordate)
+
+          if [[ -s "$FORK_TAGS_FILE" ]]; then
+            mapfile -t fork_tags < <(jq -r '.[].name' "$FORK_TAGS_FILE")
           else
-            echo "No tags to push."
+            fork_tags=()
           fi
+          
+          is_fork_created_tag() {
+            local tag=$1
+            for fork_tag in "${fork_tags[@]}"; do
+              [[ -z "$fork_tag" ]] && continue
+              [[ "$tag" == "$fork_tag" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Pruning upstream-deleted tags from origin..."
+          for origin_tag in "${origin_tags[@]}"; do
+            if ! printf '%s\n' "${upstream_tags[@]}" | grep -Fxq "$origin_tag"; then
+              if is_fork_created_tag "$origin_tag"; then
+                echo "Skipping fork-created tag $origin_tag..."
+              else
+                echo "Deleting tag $origin_tag from origin..."
+                git push origin --delete "refs/tags/$origin_tag"
+              fi
+            fi
+          done
+          
+          echo "Syncing new tags from upstream to origin..."
+          for upstream_tag in "${upstream_tags[@]}"; do
+            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$upstream_tag"; then
+              echo "Pushing upstream tag $upstream_tag to origin..."
+              git push origin "$upstream_tag"
+            fi
+          done
+          
+          echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -Rcs .)" >> "$GITHUB_OUTPUT"
 
   build-and-push-images:
     name: Build & Push Images to Registries
-    needs:
-      - retrieve-info
-      - collect-tags
-      - sync-fork
+    needs: [collect-metadata, sync-fork]
     strategy:
       matrix:
         registry: [ghcr, dockerhub]
-    uses: ./.github/workflows/build-and-push-docker-images-chunked.yml
+    uses: ./.github/workflows/build-and-push-docker-images.yml
     with:
-      repo_tags: ${{ needs.collect-tags.outputs.repo_tags }}
+      origin_tags: ${{ needs.sync-fork.outputs.origin_tags }}
       registry: ${{ matrix.registry }}
-      upstream_full_name: ${{ needs.retrieve-info.outputs.upstream_full_name }}
+      upstream_full_name: ${{ needs.collect-metadata.outputs.upstream_full_name }}

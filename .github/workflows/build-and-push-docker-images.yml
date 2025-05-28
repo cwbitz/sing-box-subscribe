@@ -1,0 +1,481 @@
+name: Build & Push Docker Images
+
+on:
+  workflow_call:
+    inputs:
+      origin_tags:
+        type: string
+        required: true
+      registry:
+        type: string
+        required: true
+      upstream_full_name:
+        type: string
+        required: true
+
+jobs:
+  pre-build:
+    name: Pre-Build Setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      buildx_platforms: ${{ steps.detect-platforms.outputs.BUILDX_PLATFORMS }}
+      upstream_license: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_LICENSE }}
+      upstream_contributors: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_CONTRIBUTORS }}
+      ghcr_url_base: ${{ steps.check-registry.outputs.GHCR_URL_BASE }}
+      ghcr_repo_exists: ${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}
+      dh_repo_exists: ${{ steps.check-registry.outputs.DH_REPO_EXISTS }}
+      tags_to_build: ${{ steps.analyze-tags.outputs.TAGS_TO_BUILD }}
+      tags_to_delete: ${{ steps.analyze-tags.outputs.TAGS_TO_DELETE }}
+    steps:
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Detect Supported Buildx Platforms
+        id: detect-platforms
+        run: |
+          set -euo pipefail
+
+          echo "Detecting supported buildx platforms..."
+          platforms=$(
+            docker buildx inspect \
+            | grep "Platforms:" \
+            | sed 's/Platforms: //g' \
+            | jq -R 'split(",") | map(trim)'
+          )
+          
+          if [[ "$platforms" == "[]" ]]; then
+            echo "No platforms detected."
+            exit 1
+          fi
+
+          echo "Detected supported buildx platforms: $platforms_json"
+          echo "BUILDX_PLATFORMS=$platforms" >> "$GITHUB_OUTPUT"
+
+      - name: Collect Upstream Metadata
+        id: collect-upstream-metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          upstream_full_name: ${{ inputs.upstream_full_name }}
+        run: |
+          set -euo pipefail
+
+          # Extract upstream repository's license
+          license=$(
+            curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$upstream_full_name/license" \
+            | jq -r '.license?.spdx_id // ""'
+          )
+
+          if [[ -n $license ]]; then
+            echo "Detected license: $license from the upstream repository $upstream_full_name"
+          else
+            echo "License not detected from the upstream repository $upstream_full_name"
+          fi
+
+          echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
+
+          # Extract upstream repository's contributors
+          contributors=$(
+            curl -sf "https://api.github.com/repos/$upstream_full_name/contributors" \
+            | jq -re '[.[] | select(.type == "User") | .login] | join(",")'
+          )
+
+          echo "Upstream repository contributors: $contributors"
+          echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
+
+      - name: Check Registry Repository Existence
+        id: check-registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Check GHCR repository existence
+          if [[ "${{ inputs.registry }}" == "ghcr" ]]; then
+            # Detect if the GHCR repository belongs to a user or organization
+            ghcr_owner_type=$(
+              curl -sf "https://api.github.com/repos/${{ github.repository }}" \
+              | jq -re '.owner.type'
+            )
+
+            case "${ghcr_owner_type,,}" in
+              organization)
+                ghcr_url_base="https://api.github.com/orgs/${{ github.repository_owner }}"
+                ;;
+              user)
+                ghcr_url_base="https://api.github.com/users/${{ github.repository_owner }}"
+                ;;
+              *)
+                echo "Error: Unsupported owner type '$ghcr_owner_type'" >&2
+                exit 1
+                ;;
+            esac
+
+            echo "GHCR_URL_BASE=$ghcr_url_base" >> "GITHUB_OUTPUT"
+
+            ghcr_http_code=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" -o /dev/null -w "%{http_code}" "$ghcr_url_base/packages/container/${{ github.event.repository.name }}")
+
+            if [[ "$ghcr_http_code" == "200" ]]; then
+              echo "GHCR repository exists"
+              echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
+            else 
+              echo "GHCR repository does not exist yet"
+              echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+            fi
+          
+          # Check Docker Hub repository existence
+          elif [[ "${{ inputs.registry }}" == "dockerhub" ]]; then
+            dh_http_code=$(curl -sf -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}")
+            
+            if [[ "$dh_http_code" == "200" ]]; then
+              echo "Docker Hub repository exists"
+              echo "DH_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Docker Hub repository does not exist yet"
+              echo "DH_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Analyze Registry Tags
+        id: analyze-tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORIGIN_TAGS: ${{ inputs.origin_tags }}
+        run: |
+          set -euo pipefail
+          
+          mapfile -t origin_tags < <(echo "$ORIGIN_TAGS" | jq -r '.[]')
+          echo "Found ${#origin_tags[@]} tags in Github repository"
+
+          registry_tags=()
+
+          case "${{ inputs.registry }}" in
+            "ghcr")
+              echo "Fetching tags from GHCR..."
+              page=1
+              while :; do
+                response=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+                  "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}/versions?per_page=100&page=$page")
+                
+                mapfile -t page_tags < <(echo "$response" | jq -r '.[].metadata.container.tags[]? // empty')
+                [[ ${#page_tags[@]} -eq 0 ]] && break
+                
+                registry_tags+=("${page_tags[@]}")
+                ((page++))
+              done
+              ;;
+
+            "dockerhub")
+              echo "Fetching tags from Docker Hub..."
+              next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+              
+              while [[ -n "$next_url" ]]; do
+                response=$(curl -sf "$next_url")
+                mapfile -t page_tags < <(echo "$response" | jq -r '.results[].name // empty')
+                registry_tags+=("${page_tags[@]}")
+                next_url=$(echo "$response" | jq -r '.next // empty')
+              done
+              ;;
+          esac
+
+          echo "Found ${#registry_tags[@]} tags in ${{ inputs.registry }} registry"
+
+          tags_to_build=()
+          tags_to_delete=()
+
+          for tag in "${origin_tags[@]}"; do
+            if ! printf '%s\n' "${registry_tags[@]}" | grep -Fxq "$tag"; then
+              echo "Found new tag to build: $tag"
+              tags_to_build+=("$tag")
+            fi
+          done
+
+          for tag in "${registry_tags[@]}"; do
+            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$tag"; then
+              echo "Found outdated tag to delete: $tag"
+              tags_to_delete+=("$tag")
+            fi
+          done
+
+          echo "TAGS_TO_BUILD=$(printf '%s\n' "${tags_to_build[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+          echo "TAGS_TO_DELETE=$(printf '%s\n' "${tags_to_delete[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+
+  build-and-push-ghcr:
+    name: Build & Push to GHCR
+    if: ${{ inputs.registry == 'ghcr' }}
+    needs: [pre-build]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILDX_PLATFORMS: ${{ needs.pre-build.outputs.buildx_platforms }}
+      TAGS_TO_DELETE: ${{ needs.pre-build.outputs.tags_to_delete }}
+      TAGS_TO_BUILD: ${{ needs.pre-build.outputs.tags_to_build }}
+      SBOM_FORMAT: spdx
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Remove Outdated GHCR Tags
+        if: needs.pre-build.outputs.tags_to_delete != '[]'
+        run: |
+          set -euo pipefail
+          
+          echo "Removing outdated tags from GHCR..."
+          for tag in $(echo "$TAGS_TO_DELETE" | jq -r '.[]'); do
+            echo "Deleting tag: $tag"
+            response=$(curl -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -w "%{http_code}" \
+              "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}/versions/$tag")
+            
+            if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
+              echo "Successfully deleted tag: $tag"
+            else
+              echo "Failed to delete tag: $tag (HTTP $response)"
+              exit 1
+            fi
+          done
+          echo "Tag cleanup completed on GHCR"
+
+      - name: Build and Push GHCR Images
+        env:
+          upstream_license: ${{ needs.pre-build.outputs.upstream_license }}
+        run: |
+          set -euo pipefail
+          
+          if [[ "$TAGS_TO_BUILD" == "[]" ]]; then
+            echo "No tags to build"
+            exit 0
+          fi
+
+          current_commit=$(git rev-parse HEAD)
+          for platform in $(echo "$BUILDX_PLATFORMS" | jq -r '.[]'); do
+            for tag in $(echo "$TAGS_TO_BUILD" | jq -r '.[]'); do
+              echo "Building for platform: $platform, tag: $tag"
+              echo "Checking out tag: $tag"
+              if ! git checkout "$tag"; then
+                echo "[ERROR] Failed to checkout tag: $tag"
+                git checkout "$current_commit"
+                exit 1
+              fi
+
+              if [[ ! -f "./Dockerfile" ]]; then
+                echo "[ERROR] Dockerfile not found at tag: $tag"
+                git checkout "$current_commit"
+                exit 1
+              fi
+  
+              build_args=(
+                --platform "$platform"
+                --tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$tag"
+                
+                # Cache configuration
+                --cache-from "type=registry,ref=ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }}"
+                --cache-to "type=registry,ref=ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }},mode=max"
+                
+                # OCI labels
+                --label "org.opencontainers.image.title=${{ github.event.repository.name }}"
+                --label "org.opencontainers.image.version=$tag"
+                --label "org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}"
+                --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.upstream_contributors }}"
+                --label "org.opencontainers.image.revision=${{ github.sha }}"
+                --label "org.opencontainers.image.sbom.format=$SBOM_FORMAT"
+                
+                # OCI annotations
+                --annotation "org.opencontainers.image.description=Docker image built from ${{ github.server_url }}/${{ github.repository }}"
+                --annotation "org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/docs"
+                --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+                --annotation "org.opencontainers.image.url=https://github.com/${{ github.actor }}/${{ github.event.repository.name }}/packages"
+                
+                # Build configuration
+                --provenance=inline
+                --sbom=true
+                --sbom-format="$SBOM_FORMAT"
+                --push
+              )
+
+              # Add license label if available
+              if [[ -n "$upstream_license" ]]; then
+                build_args+=(--label "org.opencontainers.image.licenses=$upstream_license")
+              fi
+
+              # Execute build
+              echo "Building image for platform: $platform, tag: $tag"
+              if ! docker buildx build "${build_args[@]}" .; then
+                echo "[ERROR] Failed to build/push for platform: $platform, tag: $tag"
+                git checkout "$current_commit"
+                exit 1
+              fi
+              
+              echo "[SUCCESS] Built and pushed for platform: $platform, tag: $tag"             
+              git checkout "$current_commit"
+            done
+          done
+
+          if [[ "${{ needs.pre-build.outputs.ghcr_repo_exists }}" == "false" ]]; then
+            echo "Setting GHCR repository description..."
+            curl -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "{\"description\":\"Docker image built from ${{ github.server_url }}/${{ github.repository }}\",\"repository_url\":\"${{ github.server_url }}/${{ github.repository }}\"}" \
+              "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}"
+            echo "GHCR repository description updated"
+          fi
+
+  build-and-push-dockerhub:
+    name: Build & Push to Docker Hub
+    if: ${{ inputs.registry == 'dockerhub' }}
+    needs: [pre-build]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    env:
+      BUILDX_PLATFORMS: ${{ needs.pre-build.outputs.buildx_platforms }}
+      TAGS_TO_DELETE: ${{ needs.pre-build.outputs.tags_to_delete }}
+      TAGS_TO_BUILD: ${{ needs.pre-build.outputs.tags_to_build }}
+      SBOM_FORMAT: spdx
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PAT }}
+
+      - name: Remove Outdated Docker Hub Tags
+        if: needs.pre-build.outputs.tags_to_delete != '[]'
+        run: |
+          set -euo pipefail
+          
+          echo "Removing outdated tags from Docker Hub..."
+          for tag in $(echo "$TAGS_TO_DELETE" | jq -r '.[]'); do
+            echo "Deleting tag: $tag"
+            response=$(curl -X DELETE \
+              -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
+              -w "%{http_code}" \
+              "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/$tag/")
+            
+            if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
+              echo "Successfully deleted tag: $tag"
+            else
+              echo "Failed to delete tag: $tag (HTTP $response)"
+              exit 1
+            fi
+          done
+          echo "Tag cleanup completed on Docker Hub"
+
+      - name: Build and Push Docker Hub Images
+        env:
+          upstream_license: ${{ needs.pre-build.outputs.upstream_license }}
+        run: |
+          set -euo pipefail
+          
+          if [[ "$TAGS_TO_BUILD" == "[]" ]]; then
+            echo "No tags to build"
+            exit 0
+          fi
+
+          current_commit=$(git rev-parse HEAD)
+          for platform in $(echo "$BUILDX_PLATFORMS" | jq -r '.[]'); do
+            for tag in $(echo "$TAGS_TO_BUILD" | jq -r '.[]'); do
+              echo "Building for platform: $platform, tag: $tag"
+
+              # Checkout specific tag
+              echo "Checking out tag: $tag"
+              if ! git checkout "$tag"; then
+                echo "[ERROR] Failed to checkout tag: $tag"
+                git checkout "$current_commit"
+                exit 1
+              fi
+
+              if [[ ! -f "./Dockerfile" ]]; then
+                echo "[ERROR] Dockerfile not found at tag: $tag"
+                git checkout "$current_commit"
+                exit 1
+              fi
+
+              # Prepare build arguments
+              build_args=(
+                --platform "$platform"
+                --tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:$tag"
+                
+                # Cache configuration
+                --cache-from "type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }}"
+                --cache-to "type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }},mode=max"
+                
+                # OCI labels
+                --label "org.opencontainers.image.title=${{ github.event.repository.name }}"
+                --label "org.opencontainers.image.version=$tag"
+                --label "org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}"
+                --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.upstream_contributors }}"
+                --label "org.opencontainers.image.revision=${{ github.sha }}"
+                --label "org.opencontainers.image.sbom.format=$SBOM_FORMAT"
+                
+                # OCI annotations
+                --annotation "org.opencontainers.image.description=Docker image built from ${{ github.server_url }}/${{ github.repository }}"
+                --annotation "org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/docs"
+                --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+                --annotation "org.opencontainers.image.url=https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}"
+                
+                # Build configuration
+                --provenance=inline
+                --sbom=true
+                --sbom-format="$SBOM_FORMAT"
+                --push
+              )
+
+              # Add license label if available
+              if [[ -n "$upstream_license" ]]; then
+                build_args+=(--label "org.opencontainers.image.licenses=$upstream_license")
+              fi
+
+              # Execute build
+              echo "Building image for platform: $platform, tag: $tag"
+              if ! docker buildx build "${build_args[@]}" .; then
+                echo "[ERROR] Failed to build/push for platform: $platform, tag: $tag"
+                exit 1
+              fi
+              echo "[SUCCESS] Built and pushed for platform: $platform, tag: $tag"
+            done
+          done
+
+          if [[ "${{ needs.pre-build.outputs.dh_repo_exists }}" == "false" ]]; then
+            echo "Setting Docker Hub repository description..."
+            curl -X PATCH \
+              -H "Content-Type: application/json" \
+              -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
+              -d "{\"description\":\"Docker image built from ${{ github.server_url }}/${{ github.repository }}\",\"full_description\":\"Built from ${{ github.server_url }}/${{ github.repository }}\"}" \
+              "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/"
+            echo "Docker Hub repository description updated"
+          fi
