@@ -143,7 +143,7 @@ jobs:
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Syncing upstream branch: $upstream_branch..."
             git checkout "$upstream_branch" || git checkout -b "$upstream_branch"  
-            git reset --hard upstream/"$upstream_branch" -- ':!.github/workflows' ':!.github/sync-metadata'
+            git reset --hard upstream/"$upstream_branch"
             git push --force origin "$upstream_branch"
           done
           
