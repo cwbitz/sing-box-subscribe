@@ -81,19 +81,7 @@ jobs:
           UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
         run: |
           set -euo pipefail
-
-          git sparse-checkout init --no-cone
           
-          cat > .git/info/sparse-checkout <<EOF
-          /*
-          !/\\.github/workflows/
-          !/\\.github/sync-metadata/
-          EOF
-          
-          # Verify patterns
-          echo "Sparse-checkout patterns:"
-          cat .git/info/sparse-checkout
-
           git fetch upstream --tags
           git fetch origin --tags
 
@@ -147,8 +135,8 @@ jobs:
 
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Syncing upstream branch: $upstream_branch..."
-            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"
-            git reset --hard "upstream/$upstream_branch"
+            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"  
+            git reset --hard upstream/"$upstream_branch" -- ":!${WORKFLOW_DIR}" ":!${METADATA_DIR}"
             git push --force origin "$upstream_branch"
           done
           
