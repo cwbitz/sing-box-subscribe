@@ -82,10 +82,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          git config core.sparseCheckout true
-          echo "/*" > .git/info/sparse-checkout
-          echo "!.github/workflows/" >> .git/info/sparse-checkout
-          echo "!.github/sync-metadata/" >> .git/info/sparse-checkout
+          git sparse-checkout init --no-cone
+          
+          cat > .git/info/sparse-checkout <<EOF
+          /*
+          !/\\.github/workflows/
+          !/\\.github/sync-metadata/
+          EOF
+          
+          # Verify patterns
+          echo "Sparse-checkout patterns:"
+          cat .git/info/sparse-checkout
 
           git fetch upstream --tags
           git fetch origin --tags
