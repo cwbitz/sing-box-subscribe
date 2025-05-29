@@ -49,7 +49,6 @@ jobs:
     needs: [collect-metadata]
     permissions:
       contents: write
-      actions: write
     env:
       FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
       FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
@@ -143,8 +142,8 @@ jobs:
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Syncing upstream branch: $upstream_branch..."
             git checkout "$upstream_branch" || git checkout -b "$upstream_branch"  
-            git reset --hard upstream/"$upstream_branch"
-            git push --force origin "$upstream_branch"
+            git merge --ff-only "upstream/$upstream_branch"
+            git push --force-with-lease origin "$upstream_branch"
           done
           
           # Prune and Sync Tags
