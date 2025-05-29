@@ -135,8 +135,22 @@ jobs:
 
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Syncing upstream branch: $upstream_branch..."
-            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"  
-            git reset --hard upstream/"$upstream_branch" -- ':!.github/workflows' ':!.github/sync-metadata'
+            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"
+            
+            mkdir -p temp_backup
+            cp -r "$WORKFLOW_DIR" temp_backup/ || true
+            cp -r "$METADATA_DIR" temp_backup/ || true
+            
+            git reset --hard "upstream/$upstream_branch"
+            
+            if [ -d "temp_backup/workflows" ]; then
+              cp -r temp_backup/workflows/* "$WORKFLOW_DIR/"
+            fi
+            if [ -d "temp_backup/sync-metadata" ]; then
+              cp -r temp_backup/sync-metadata/* "$METADATA_DIR/"
+            fi
+            rm -rf temp_backup
+            
             git push --force origin "$upstream_branch"
           done
           
