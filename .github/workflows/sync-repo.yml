@@ -1,9 +1,5 @@
 name: Sync Repo
 
-permissions:
-  contents: write
-  actions: write
-
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -51,6 +47,9 @@ jobs:
     name: Sync Forked Repository
     runs-on: ubuntu-latest
     needs: [collect-metadata]
+    permissions:
+      contents: write
+      actions: write
     env:
       FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
       FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
