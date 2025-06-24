@@ -1,0 +1,161 @@
+name: Track Fork-Created Branches and Tags
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+
+env:
+  METADATA_DIR: .github/sync-metadata
+
+concurrency:
+  group: track-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    if: github.actor == github.repository_owner
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Ref Type and Name
+        id: detect-ref
+        run: |
+          case "${GITHUB_REF}" in
+            refs/heads/*)
+              echo "ref_type=branch" >> "$GITHUB_OUTPUT"
+              echo "ref_name=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+              ;;
+            refs/tags/*)
+              echo "ref_type=tag" >> "$GITHUB_OUTPUT"
+              echo "ref_name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+        shell: bash
+
+      - name: Get Parent Repository
+        id: parent-repo
+        env:
+          REPO_JSON: ${{ toJson(github.event.repository) }}
+        run: |
+          # Safely extract parent repository if this is a fork
+          if [[ "${{ github.event.repository.fork }}" == "true" ]]; then
+            # Use jq to safely extract parent repo from GitHub context
+            PARENT_REPO=$(echo "$REPO_JSON" | jq -r '.parent.full_name // ""')
+            echo "parent_repo=$PARENT_REPO" >> "$GITHUB_OUTPUT"
+          else
+            echo "parent_repo=" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Update Tracking Files
+        id: update-tracking
+        env:
+          REF_TYPE: ${{ steps.detect-ref.outputs.ref_type }}
+          REF_NAME: ${{ steps.detect-ref.outputs.ref_name }}
+          PARENT_REPO: ${{ steps.parent-repo.outputs.parent_repo }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$METADATA_DIR"
+          FORK_BRANCHES_FILE="$METADATA_DIR/fork-created-branches.json"
+          FORK_TAGS_FILE="$METADATA_DIR/fork-created-tags.json"
+
+          if [[ "$REF_TYPE" == "branch" ]]; then
+            if [[ ! -s "$FORK_BRANCHES_FILE" ]]; then
+              echo '[]' > "$FORK_BRANCHES_FILE"
+            fi
+
+            BRANCH_NAME="$REF_NAME"
+            BRANCH_COMMIT=$(git rev-parse "$REF_NAME")
+            BRANCH_DATE=$(git show -s --format=%ci "$BRANCH_COMMIT")
+            BRANCH_AUTHOR=$(git show -s --format='%an <%ae>' "$BRANCH_COMMIT")
+            NEW_ENTRY=$(jq -nc \
+              --arg name "$BRANCH_NAME" \
+              --arg commit "$BRANCH_COMMIT" \
+              --arg date "$BRANCH_DATE" \
+              --arg author "$BRANCH_AUTHOR" \
+              '{name: $name, commit: $commit, date: $date, author: $author}')
+
+            # Check for upstream branch collision
+            if [[ -n "$PARENT_REPO" ]]; then
+              git remote add upstream "https://github.com/$PARENT_REPO.git"
+              git fetch upstream
+              if git branch -r | grep -Fq "upstream/$BRANCH_NAME"; then
+                echo "Error: Branch '$BRANCH_NAME' already exists in upstream. Please use a unique branch name."
+                exit 1
+              fi
+            fi
+
+            if ! jq -e --arg name "$BRANCH_NAME" '.[] | select(.name == $name)' "$FORK_BRANCHES_FILE" > /dev/null; then
+              jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_BRANCHES_FILE" > "${FORK_BRANCHES_FILE}.tmp"
+              mv "${FORK_BRANCHES_FILE}.tmp" "$FORK_BRANCHES_FILE"
+              echo "added=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Branch entry already recorded."
+              echo "added=false" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            if [[ ! -s "$FORK_TAGS_FILE" ]]; then
+              echo '[]' > "$FORK_TAGS_FILE"
+            fi
+
+            TAG_NAME="$REF_NAME"
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG_NAME")
+            TAG_DATE=$(git show -s --format=%ci "$TAG_COMMIT")
+            TAG_AUTHOR=$(git show -s --format='%an <%ae>' "$TAG_COMMIT")
+            NEW_ENTRY=$(jq -nc \
+              --arg name "$TAG_NAME" \
+              --arg commit "$TAG_COMMIT" \
+              --arg date "$TAG_DATE" \
+              --arg author "$TAG_AUTHOR" \
+              '{name: $name, commit: $commit, date: $date, author: $author}')
+
+            # Check for upstream tag collision
+            if [[ -n "$PARENT_REPO" ]]; then
+              git remote add upstream "https://github.com/$PARENT_REPO.git"
+              git fetch upstream --tags
+              if git tag -l | grep -Fxq "$TAG_NAME"; then
+                echo "Error: Tag '$TAG_NAME' already exists in upstream. Please use a unique tag name."
+                exit 1
+              fi
+            fi
+
+            if ! jq -e --arg name "$TAG_NAME" '.[] | select(.name == $name)' "$FORK_TAGS_FILE" > /dev/null; then
+              jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_TAGS_FILE" > "${FORK_TAGS_FILE}.tmp"
+              mv "${FORK_TAGS_FILE}.tmp" "$FORK_TAGS_FILE"
+              echo "added=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag entry already recorded."
+              echo "added=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Unknown ref type: $REF_TYPE"
+            echo "added=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Commit and Push Tracking Changes
+        if: ${{ steps.update-tracking.outputs.added == 'true' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          find "$METADATA_DIR" -type f \( -name 'fork-created-*.json' \) -exec git add {} +
+
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: Track fork-created ref: ${{ steps.detect-ref.outputs.ref_type }} ${{ steps.detect-ref.outputs.ref_name }}"
+            git push origin HEAD:${{ steps.detect-ref.outputs.ref_name }}
+          else
+            echo "No changes to commit"
+          fi
+        shell: bash
