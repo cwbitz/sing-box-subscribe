@@ -1,0 +1,244 @@
+name: Sync Repo
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_PAT: ${{ secrets.GH_PAT }}
+  WORKFLOW_DIR: .github/workflows/
+  METADATA_DIR: .github/sync-metadata/
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-fork:
+    name: Sync Forked Repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.json
+      FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
+      ORIGIN_REPO_FULL: ${{ github.repository }}
+    outputs:
+      origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
+      upstream_full_name: ${{ steps.fetch-parent-metadata.outputs.UPSTREAM_FULL_NAME }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Fetch Parent Repository Metadata
+        id: fetch-parent-metadata
+        env:
+          GH_REPO_FULL: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching parent repository metadata..."
+          response=$(gh api repos/$GH_REPO_FULL)
+
+          if echo "$response" | jq -e '.fork == true'; then
+            echo "This repository is a fork. Fetching parent metadata..."
+            echo "UPSTREAM_FULL_NAME=$(echo "$response" | jq -r '.parent.full_name')" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
+          else
+            echo "This repository is not a fork!"
+            exit 1
+          fi
+
+      - name: Configure Git and Origin/Upstream Remote
+        env:
+          UPSTREAM_URL: ${{ steps.fetch-parent-metadata.outputs.UPSTREAM_URL }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/$ORIGIN_REPO_FULL.git"
+
+          if ! git remote get-url upstream &> /dev/null; then
+            git remote add upstream "$UPSTREAM_URL"
+          else
+            git remote set-url upstream "$UPSTREAM_URL"
+          fi
+        shell: bash
+
+      - name: Sync Branches and Tags
+        id: sync-branches-and-tags
+        run: |
+          set -euo pipefail
+
+          git fetch upstream --tags
+          git fetch origin --tags
+
+          # Prune and Sync Branches
+          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/ | grep -v '^HEAD$')
+          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/ | grep -v '^HEAD$')
+
+          echo "Checking for metadata directory conflicts..."
+          for upstream_branch in "${upstream_branches[@]}"; do
+            if git show "upstream/$upstream_branch:$METADATA_DIR" &>/dev/null; then
+              echo "[CONFLICTS] Metadata directory $METADATA_DIR in origin conflicts with upstream"
+              exit 1
+            fi
+          done
+
+          if [[ -s "$FORK_BRANCHES_FILE" ]]; then
+            mapfile -t fork_branches < <(jq -r '.[].name' "$FORK_BRANCHES_FILE")
+          else
+            fork_branches=()
+          fi
+
+          is_fork_created_branch() {
+            local branch=$1
+            for fork_branch in "${fork_branches[@]}"; do
+              [[ -z "$fork_branch" ]] && continue
+              [[ "$branch" == "$fork_branch" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Detecting upstream-deleted branches to prune..."
+          for origin_branch in "${origin_branches[@]}"; do
+            if ! printf '%s\n' "${upstream_branches[@]}" | grep -Fxq "$origin_branch"; then
+              if is_fork_created_branch "$origin_branch"; then
+                echo "Skipping fork-created branch $origin_branch..."
+              else
+                echo "Pruning upstream-deleted branch $origin_branch from origin..."
+                git push origin --delete "$origin_branch"
+              fi
+            fi
+          done
+          
+          echo "Checking for branch name conflicts..."
+          conflicts=()
+          for upstream_branch in "${upstream_branches[@]}"; do
+            if is_fork_created_branch "$upstream_branch"; then
+              conflicts+=("$upstream_branch")
+            fi
+          done
+
+          if [[ ${#conflicts[@]} -gt 0 ]]; then
+            echo "[CONFLICTS] The following branches in origin conflict with upstream:"
+            printf '%s\n' "${conflicts[@]}"
+            echo "Rename conflicted branches and update fork-created-branches.json accordingly"
+            exit 1
+          fi
+
+          # Preserve Metadata and Workflow Directories
+          for upstream_branch in "${upstream_branches[@]}"; do
+            echo "Processing branch: $upstream_branch..."
+            temp_dir=$(mktemp -d)
+            if git rev-parse --quiet --verify HEAD:"$WORKFLOW_DIR"; then
+              echo "Preserving workflow files..."
+              git archive HEAD "$WORKFLOW_DIR" | tar xf - -C "$temp_dir"
+            else
+              echo "No workflow files to preserve"
+            fi
+            if git rev-parse --quiet --verify HEAD:"$METADATA_DIR"; then
+              echo "Preserving metadata files..."
+              git archive HEAD "$METADATA_DIR" | tar xf - -C "$temp_dir"
+            else
+              echo "No metadata files to preserve"
+            fi
+            
+            git switch "$upstream_branch" 2>/dev/null || git switch -c "$upstream_branch"
+            git reset --hard "upstream/$upstream_branch"
+            rm -rf "$WORKFLOW_DIR"
+            
+            # Restore our workflow files if any
+            if [[ -d "$temp_dir/$WORKFLOW_DIR" ]]; then
+              echo "Restoring our workflow files..."
+              mkdir -p "$WORKFLOW_DIR"
+              cp -r "$temp_dir/$WORKFLOW_DIR/." "$WORKFLOW_DIR/"
+            fi
+
+            # Restore our metadata files if any
+            if [[ -d "$temp_dir/$METADATA_DIR" ]]; then
+              echo "Restoring our metadata files..."
+              mkdir -p "$METADATA_DIR"
+              cp -r "$temp_dir/$METADATA_DIR/." "$METADATA_DIR/"
+            fi            
+            rm -rf "$temp_dir"
+
+            # Add changes if directories exist and have content
+            if [[ -n "$(ls -A "$WORKFLOW_DIR" 2>/dev/null)" ]]; then
+              git add "$WORKFLOW_DIR"
+            fi
+            if [[ -n "$(ls -A "$METADATA_DIR" 2>/dev/null)" ]]; then
+              git add "$METADATA_DIR"
+            fi
+
+            # Commit and push changes
+            if ! git diff --cached --quiet; then
+              git commit --amend -m "Sync with upstream and preserve workflow/metadata files"
+              git push --force-with-lease origin "$upstream_branch"
+            fi
+            echo "Completed processing branch: $upstream_branch"
+          done
+
+          # Prune and Sync Tags
+          mapfile -t upstream_tags < <(git tag -l --sort=creatordate)
+          mapfile -t origin_tags < <(git tag -l --sort=creatordate)
+
+          if [[ -s "$FORK_TAGS_FILE" ]]; then
+            mapfile -t fork_tags < <(jq -r '.[].name' "$FORK_TAGS_FILE")
+          else
+            fork_tags=()
+          fi
+          
+          is_fork_created_tag() {
+            local tag=$1
+            for fork_tag in "${fork_tags[@]}"; do
+              [[ -z "$fork_tag" ]] && continue
+              [[ "$tag" == "$fork_tag" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Pruning upstream-deleted tags from origin..."
+          for origin_tag in "${origin_tags[@]}"; do
+            if ! printf '%s\n' "${upstream_tags[@]}" | grep -Fxq "$origin_tag"; then
+              if is_fork_created_tag "$origin_tag"; then
+                echo "Skipping fork-created tag $origin_tag..."
+              else
+                echo "Deleting tag $origin_tag from origin..."
+                git push origin --delete "refs/tags/$origin_tag"
+              fi
+            fi
+          done
+          
+          echo "Syncing new tags from upstream to origin..."
+          for upstream_tag in "${upstream_tags[@]}"; do
+            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$upstream_tag"; then
+              echo "Pushing upstream tag $upstream_tag to origin..."
+              git push origin "$upstream_tag"
+            fi
+          done
+          
+          echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  test-build-push-images:
+    name: Test, Build & Push Images to Registries
+    needs: [sync-fork]
+    strategy:
+      matrix:
+        registry: [ghcr, dockerhub]
+    uses: ./.github/workflows/test-build-push-docker-images.yml
+    with:
+      upstream_full_name: ${{ needs.sync-fork.outputs.upstream_full_name }}
+      origin_tags: ${{ needs.sync-fork.outputs.origin_tags }}
+      registry: ${{ matrix.registry }}
+    secrets:
+      DH_PAT: ${{ secrets.DH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}
