@@ -1,0 +1,1552 @@
+name: Test, Build & Push Docker Images
+
+on:
+  workflow_call:
+    inputs:
+      upstream_full_name:
+        type: string
+        required: true
+      origin_tags_with_dockerfile_json:
+        type: string
+        required: true
+    secrets:
+      GH_PAT:
+        required: true
+      DH_PAT:
+        required: true
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DH_OWNER: ${{ vars.DH_USERNAME }}
+  GH_PAT: ${{ secrets.GH_PAT }}
+  DH_PAT: ${{ secrets.DH_PAT }}
+  ORIGIN_OWNER: ${{ github.actor }}
+  ORIGIN_REPO_NAME: ${{ github.event.repository.name }}
+  ORIGIN_REPO_FULL: ${{ github.repository }}
+  ORIGIN_SERVER_URL: ${{ github.server_url }}
+  GHCR_API_PREFIX: ${{ github.event.repository.owner.type == 'Organization' && format('orgs/{0}', github.repository_owner) || format('users/{0}', github.repository_owner) }}
+  MAX_TOTAL_SEMVER_TAGS: 30
+  MAX_TAGS_PER_BATCH: 15
+
+jobs:
+  pre-build:
+    name: Pre-Build Setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      JOB_BUILDX_PLATFORMS_JSON: ${{ steps.detect-platforms.outputs.BUILDX_PLATFORMS_JSON }}
+      JOB_UPSTREAM_LICENSE: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_LICENSE }}
+      JOB_UPSTREAM_CONTRIBUTORS: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_CONTRIBUTORS }}
+      JOB_GHCR_REPO_EXISTS: ${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}
+      JOB_DH_REPO_EXISTS: ${{ steps.check-registry.outputs.DH_REPO_EXISTS }}
+      JOB_GHCR_META_JSON: ${{ steps.analyze-tags.outputs.GHCR_META_JSON }}
+      JOB_GHCR_DEL_TAGS_JSON: ${{ steps.analyze-tags.outputs.GHCR_DEL_TAGS_JSON }}
+      JOB_GHCR_TEST_TAGS_JSON: ${{ steps.analyze-tags.outputs.GHCR_TEST_TAGS_JSON }}
+      JOB_GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON: ${{ steps.analyze-tags.outputs.GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON }}
+      JOB_GHCR_LATEST_TAG: ${{ steps.analyze-tags.outputs.GHCR_LATEST_TAG }}
+      JOB_DH_META_JSON: ${{ steps.analyze-tags.outputs.DH_META_JSON }}
+      JOB_DH_DEL_TAGS_JSON: ${{ steps.analyze-tags.outputs.DH_DEL_TAGS_JSON }}
+      JOB_DH_TEST_TAGS_JSON: ${{ steps.analyze-tags.outputs.DH_TEST_TAGS_JSON }}
+      JOB_DH_SEMVER_TAGS_AFTER_CLEANUP_JSON: ${{ steps.analyze-tags.outputs.DH_SEMVER_TAGS_AFTER_CLEANUP_JSON }}
+      JOB_DH_LATEST_TAG: ${{ steps.analyze-tags.outputs.DH_LATEST_TAG }}
+      JOB_COMBINED_TEST_TAGS_JSON: ${{ steps.analyze-tags.outputs.COMBINED_TEST_TAGS_JSON }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Detect Supported Buildx Platforms
+        id: detect-platforms
+        run: |
+          set -euo pipefail
+
+          echo "Detecting supported buildx platforms..."
+          buildx_platforms_json=$(docker buildx inspect | grep "Platforms:" | sed 's/Platforms: //g' | tr -d ' ' | jq -Rc 'split(",")')
+          if [[ $(echo "$buildx_platforms_json" | jq 'length') -eq 0 ]]; then
+            echo "No supported buildx platforms detected"
+            exit 1
+          fi
+          echo "buildx_platforms_json=$buildx_platforms_json"
+          echo "BUILDX_PLATFORMS_JSON=$buildx_platforms_json" >> "$GITHUB_OUTPUT"
+
+      - name: Collect Upstream Metadata
+        id: collect-upstream-metadata
+        env:
+          UPSTREAM_REPO_FULL: ${{ inputs.upstream_full_name }}
+        run: |
+          set -euo pipefail
+
+          # Fetching upstream's license information
+          echo "Fetching license information from $UPSTREAM_REPO_FULL..."
+          max_retries=5
+          retry_count=0
+          while true; do
+            set +e
+            response=$(gh api "repos/$UPSTREAM_REPO_FULL")
+            gh_exit=$?
+            set -e
+            if [[ $gh_exit -eq 0 ]]; then
+              license=$(echo "$response" | jq -r '.license.spdx_id // ""')
+              if [[ -n "$license" && "$license" != "NOASSERTION" ]]; then
+                echo "Detected license: $license from the upstream repository"
+                echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
+              else
+                echo "No license detected from upstream repo"
+                echo "UPSTREAM_LICENSE=" >> "$GITHUB_OUTPUT"
+              fi
+              break
+            else
+              status=$(echo "$response" | jq -r '.status // ""')
+              message=$(echo "$response" | jq -r '.message // ""')
+              case "$status" in
+                404)
+                  echo "GHCR API endpoint not found (HTTP 404: Not Found)"
+                  exit 1
+                  ;;
+                429)
+                  echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Rate limit exceeded after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 60
+                  continue
+                  ;;
+                500|502|503)
+                  echo "::warning::GitHub server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Server error after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                  continue
+                  ;;
+                *)
+                  echo "::error::Unexpected error:"
+                  echo "::error::$response"
+                  exit 1
+                  ;;
+              esac
+            fi
+          done
+
+          # Fetching upstream's contributor information
+          echo "Fetching contributor information from $UPSTREAM_REPO_FULL..."
+          max_retries=5
+          retry_count=0
+          while true; do
+            set +e
+            response=$(gh api "repos/$UPSTREAM_REPO_FULL/contributors")
+            gh_exit=$?
+            set -e
+            if [[ $gh_exit -eq 0 ]]; then
+              contributors=$(echo "$response" | jq -r '[.[] | select(.type == "User") | .login] | join(",") // ""')
+              if [[ -n "$contributors" ]]; then
+                echo "Upstream's contributors: $contributors"
+                echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
+              else
+                echo "No contributors detected from the upstream repository"
+                echo "UPSTREAM_CONTRIBUTORS=" >> "$GITHUB_OUTPUT"
+              fi
+              break
+            else
+              status=$(echo "$response" | jq -r '.status // ""')
+              message=$(echo "$response" | jq -r '.message // ""')
+              case "$status" in
+                404)
+                  echo "GHCR API endpoint not found (HTTP 404: Not Found)"
+                  exit 1
+                  ;;
+                429)
+                  echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Rate limit exceeded after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 60
+                  continue
+                  ;;
+                500|502|503)
+                  echo "::warning::GitHub server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Server error after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                  continue
+                  ;;
+                *)
+                  echo "::error::Unexpected error:"
+                  echo "::error::$response"
+                  exit 1
+                  ;;
+              esac
+            fi
+          done
+
+      - name: Check Registry Repository Existence
+        id: check-registry
+        run: |
+          set -euo pipefail
+
+          echo "Starting registry existence check..."
+          echo "Checking GHCR repository..."
+          max_retries=5
+          retry_count=0
+          while true; do
+            set +e
+            response=$(gh api "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME")
+            gh_exit=$?
+            set -e
+            if [[ $gh_exit -eq 0 ]]; then
+              echo "GHCR API call succeeded. Verifying package accessibility..."
+              set +e
+              versions_response=$(gh api "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions")
+              versions_exit=$?
+              set -e
+              if [[ $versions_exit -eq 0 ]]; then
+                echo "Package versions retrieved successfully. Checking if package is associated with current repository..."
+                repo_response=$(gh api "repos/$ORIGIN_REPO_FULL")
+                repo_created_at=$(echo "$repo_response" | jq -r '.created_at // ""')
+                # Get the package creation date from the main package info
+                package_created_at=$(echo "$response" | jq -r '.created_at // ""')
+                echo "Repository created at: $repo_created_at"
+                echo "Package created at: $package_created_at"
+                repo_timestamp=$(date -d "$repo_created_at" +%s 2>/dev/null || echo "0")
+                package_timestamp=$(date -d "$package_created_at" +%s 2>/dev/null || echo "0")
+                echo "Repository timestamp: $repo_timestamp"
+                echo "Package timestamp: $package_timestamp"
+                if [[ "$package_timestamp" -gt 0 && "$repo_timestamp" -gt 0 && "$package_timestamp" -lt "$repo_timestamp" ]]; then
+                  echo "Orphaned package detected. Proceeding with orphaned package deletion..."
+                  max_delete_retries=5
+                  delete_retry_count=0
+                  while true; do
+                    set +e
+                    delete_response=$(curl -sL -w "%{http_code}" -X DELETE \
+                      -H "Accept: application/vnd.github+json" \
+                      -H "Authorization: Bearer $GH_PAT" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      "https://api.github.com/$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME")
+                    delete_code="${delete_response: -3}"
+                    set -e
+                    case "$delete_code" in
+                      204)
+                        echo "Successfully deleted orphaned package: $ORIGIN_REPO_NAME"
+                        break
+                        ;;
+                      403)
+                        echo "::error::Insufficient permissions to delete orphaned package (HTTP 403)"
+                        echo ""
+                        echo "MANUAL CLEANUP REQUIRED:"
+                        echo "1. Visit: https://github.com/${{ github.repository_owner }}?tab=packages"
+                        echo "2. Find the '$ORIGIN_REPO_NAME' container package"
+                        echo "3. Delete it manually from the Packages tab"
+                        exit 1
+                        ;;
+                      429)
+                        echo "::warning::Rate limit exceeded when deleting orphaned package (HTTP 429). Retrying in 60 seconds... (attempt $((delete_retry_count + 1))/$max_delete_retries)"
+                        ((delete_retry_count++))
+                        if ((delete_retry_count >= max_delete_retries)); then
+                          echo "::error::Rate limit exceeded after $delete_retry_count attempts when deleting orphaned package"
+                          echo ""
+                          echo "MANUAL CLEANUP REQUIRED:"
+                          echo "1. Visit: https://github.com/${{ github.repository_owner }}?tab=packages"
+                          echo "2. Find the '$ORIGIN_REPO_NAME' container package"
+                          echo "3. Delete it manually from the Packages tab"
+                          exit 1
+                        fi
+                        sleep 60
+                        continue
+                        ;;
+                      500|502|503)
+                        echo "::warning::GitHub server error when deleting orphaned package (HTTP $delete_code). Retrying in 10 seconds... (attempt $((delete_retry_count + 1))/$max_delete_retries)"
+                        ((delete_retry_count++))
+                        if ((delete_retry_count >= max_delete_retries)); then
+                          echo "::error::Server error after $delete_retry_count attempts when deleting orphaned package"
+                          echo ""
+                          echo "MANUAL CLEANUP REQUIRED:"
+                          echo "1. Visit: https://github.com/${{ github.repository_owner }}?tab=packages"
+                          echo "2. Find the '$ORIGIN_REPO_NAME' container package"
+                          echo "3. Delete it manually from the Packages tab"
+                          exit 1
+                        fi
+                        sleep 10
+                        continue
+                        ;;
+                      *)
+                        echo "Failed to delete orphaned package (HTTP $delete_code)"
+                        echo ""
+                        echo "MANUAL CLEANUP REQUIRED:"
+                        echo "1. Visit: https://github.com/${{ github.repository_owner }}?tab=packages"
+                        echo "2. Find the '$ORIGIN_REPO_NAME' container package"
+                        echo "3. Delete it manually from the Packages tab"
+                        exit 1
+                        ;;
+                    esac
+                  done
+                  echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                else
+                  echo "Package creation date validates with repository. GHCR repository exists: $ORIGIN_REPO_FULL"
+                  echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
+                fi
+              else
+                echo "Failed to list package versions (exit code: $versions_exit)"
+                echo "Response: $versions_response"
+                status=$(echo "$versions_response" | jq -r '.status // ""')
+                message=$(echo "$versions_response" | jq -r '.message // ""')
+                case "$status" in
+                  403)
+                    if [[ "$message" == *"Resource not accessible by integration"* ]]; then
+                      echo "Package exists but is not accessible to current repository (insufficient permissions)"
+                      echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    else
+                      echo "Package access forbidden (HTTP 403). This may indicate a orphaned package or permission issue"
+                      echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    fi
+                    ;;
+                  404)
+                    echo "Package versions not found (HTTP 404). Package may be empty or orphaned package"
+                    echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    ;;
+                  429)
+                    echo "::warning::Rate limit exceeded when listing package versions (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    ((retry_count++))
+                    if ((retry_count >= max_retries)); then
+                      echo "::error::Rate limit exceeded after $retry_count attempts when listing package versions"
+                      echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    else
+                      sleep 60
+                      continue
+                    fi
+                    ;;
+                  500|502|503)
+                    echo "::warning::GHCR server error when listing package versions (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    ((retry_count++))
+                    if ((retry_count >= max_retries)); then
+                      echo "::error::Server error after $retry_count attempts when listing package versions"
+                      echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    else
+                      sleep 10
+                      continue
+                    fi
+                    ;;
+                  *)
+                    echo "::error::Unexpected error when listing package versions:"
+                    echo "::error::$versions_response"
+                    echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    ;;
+                esac
+              fi
+              break
+            else
+              echo "GHCR API call failed with exit code: $gh_exit"
+              echo "Response: $response"
+              status=$(echo "$response" | jq -r '.status // ""')
+              message=$(echo "$response" | jq -r '.message // ""')
+              case "$status" in
+                404)
+                  if [[ "$message" == "Package not found." ]]; then
+                    echo "GHCR repository does NOT exist (HTTP 404: Package not found)"
+                    echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                    break
+                  else
+                    echo "GHCR API endpoint not found (HTTP 404: Not Found)"
+                    exit 1
+                  fi
+                  ;;
+                429)
+                  echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Rate limit exceeded after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 60
+                  continue
+                  ;;
+                500|502|503)
+                  echo "::warning::GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Server error after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                  continue
+                  ;;
+                *)
+                  echo "::error::Unexpected error:"
+                  echo "::error::$response"
+                  exit 1
+                  ;;
+              esac
+            fi
+          done
+
+          echo "Checking Docker Hub repository..."
+          repo_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/"
+          max_retries=5
+          retry_count=0
+          while true; do
+            set +e
+            http_code=$(curl -sL -o /dev/null -w "%{http_code}" "$repo_url")
+            curl_exit=$?
+            set -e
+            if [[ $curl_exit -eq 0 ]]; then
+              case "$http_code" in
+                200)
+                  echo "Docker Hub repository exists: $DH_OWNER/$ORIGIN_REPO_NAME"
+                  echo "DH_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
+                  break
+                  ;;
+                404)
+                  echo "Docker Hub repository does NOT exist (HTTP 404)"
+                  echo "DH_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                  break
+                  ;;
+                429)
+                  echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Rate limit exceeded after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 60
+                  ;;
+                500|502|503)
+                  echo "::warning::Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Server error after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                  ;;
+                *)
+                  echo "::error::Unexpected HTTP status (HTTP $http_code)"
+                  exit 1
+                  ;;
+              esac
+            else
+              echo "::warning::Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+              ((retry_count++))
+              if ((retry_count >= max_retries)); then
+                echo "::error::Network or curl failure after $retry_count attempts"
+                exit 1
+              fi
+              sleep 10
+            fi
+          done
+
+      - name: Analyze Registry Tags
+        id: analyze-tags
+        env:
+          ORIGIN_TAGS_WITH_DOCKERFILE_JSON: ${{ inputs.origin_tags_with_dockerfile_json }}
+        run: |
+          set -euo pipefail
+
+          ghcr_test_tags_json="[]"
+          dh_test_tags_json="[]"
+
+          categorize_tags() {
+            local registry_latest_tag=$1
+            local all_registry_test_tags_json=$2
+            
+            if [[ $(echo "$all_registry_test_tags_json" | jq 'length') -gt 0 ]]; then
+              if [[ -z "$registry_latest_tag" ]]; then
+                newer_tags_json="$all_registry_test_tags_json"
+                older_tags_json="[]"
+              else
+                jq_version_functions='
+                  def parse_version(v):
+                    v | sub("^v"; "") | split(".") | map(tonumber);
+                  def version_gt(v1; v2):
+                    def compare_parts(v1_parts; v2_parts):
+                      if v1_parts[0] > v2_parts[0] then 
+                        true
+                      elif v1_parts[0] == v2_parts[0] and v1_parts[1] > v2_parts[1] then
+                        true
+                      elif v1_parts[0] == v2_parts[0] and v1_parts[1] == v2_parts[1] and v1_parts[2] > v2_parts[2] then
+                        true
+                      else 
+                        false
+                      end;
+                    compare_parts(parse_version(v1); parse_version(v2));
+                '
+                newer_tags_json=$(echo "$all_registry_test_tags_json" | jq -c --arg latest "$registry_latest_tag" \
+                  "$jq_version_functions"'
+                  [
+                    .[] | select(. as $t | version_gt($t; $latest))
+                  ]
+                ')
+                older_tags_json=$(echo "$all_registry_test_tags_json" | jq -c --arg latest "$registry_latest_tag" \
+                  "$jq_version_functions"'
+                  [
+                    .[] | select(. as $t | version_gt($latest; $t))
+                  ]
+                ')
+              fi
+            else
+              newer_tags_json="[]"
+              older_tags_json="[]"
+            fi
+
+            echo "newer_tags_json: $newer_tags_json"
+            echo "older_tags_json: $older_tags_json"
+          }
+
+          # GHCR Analysis
+          echo "Analyzing GHCR tags..."
+          ghcr_meta_json="[]"
+          ghcr_del_tags_json="[]"
+          ghcr_test_tags_json="[]"
+          ghcr_semver_tags_json="[]"
+          ghcr_latest_tag=''
+          case "${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}" in
+            "false")
+              echo "GHCR repository does NOT exist. Running fallback tag analysis."
+              if [[ $(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length') -eq 0 ]]; then
+                echo "No tags with Dockerfile detected in origin repository."
+                ghcr_test_tags_json="[]"
+              else
+                origin_count=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length')
+                if (( origin_count >= MAX_TAGS_PER_BATCH )); then
+                ghcr_test_tags_json=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq -c --argjson max "$MAX_TAGS_PER_BATCH" '
+                map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                | sort_by([.major, .minor, .patch] | map(tonumber))
+                | .[-$max:]
+                | map("\(.major).\(.minor).\(.patch)")
+                ')
+                else
+                  ghcr_test_tags_json=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq -c '
+                    map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                    | sort_by([.major, .minor, .patch] | map(tonumber))
+                    | map("\(.major).\(.minor).\(.patch)")
+                  ')
+                fi
+              fi
+              echo "ghcr_test_tags_json: $ghcr_test_tags_json"
+
+              echo "GHCR_TEST_TAGS_JSON=$ghcr_test_tags_json" >> "$GITHUB_OUTPUT"
+              echo "GHCR_META_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "GHCR_DEL_TAGS_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "GHCR_LATEST_TAG=" >> "$GITHUB_OUTPUT"
+              ;;
+            "true")
+              max_retries=5
+              retry_count=0
+              while true; do
+                set +e
+                response=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions?per_page=100")
+                gh_exit=$?
+                set -e
+                if [[ $gh_exit -eq 0 ]]; then
+                  echo "GHCR repository exists. Parsing tags..."
+                  ghcr_meta_json=$(echo "$response" | jq -c '
+                    if length > 0 then
+                      map({
+                        id: (.id | tostring),
+                        tags: ([
+                          .metadata.container.tags[]
+                          | select(
+                              test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$")
+                              or test("^v?[0-9]+\\.[0-9]+$")
+                              or test("^v?[0-9]+$")
+                              or . == "latest"
+                            )
+                        ] | map(sub("^v"; "")))
+                      })
+                      | map(select(.tags | length > 0))
+                    else
+                      []
+                    end
+                  ')
+                  break
+                else
+                  status=$(echo "$response" | jq -r '.status // ""')
+                  message=$(echo "$response" | jq -r '.message // ""')
+                  case "$status" in
+                    429)
+                      echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Rate limit exceeded after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 60
+                      continue
+                      ;;
+                    500|502|503)
+                      echo "::warning::GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Server error after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 10
+                      continue
+                      ;;
+                    *)
+                      echo "::error::Unexpected error:"
+                      echo "::error::$response"
+                      exit 1
+                      ;;
+                  esac
+                fi
+              done
+              echo "ghcr_meta_json: $ghcr_meta_json"
+
+              ghcr_semver_tags_json=$(echo "$ghcr_meta_json" | jq -c '
+                [
+                  .[] | .tags[]
+                  | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                ]
+              ')
+              echo "ghcr_semver_tags_json: $ghcr_semver_tags_json"
+
+              # Find tags to delete - tags in GHCR but not in origin
+              if [[ "$(echo "$ghcr_semver_tags_json" | jq 'length')" == "0" ]]; then
+                echo "No semantic version tags detected in GHCR"
+                ghcr_del_tags_json="[]"
+              else
+                ghcr_del_tags_json=$(jq -nc --argjson a "$ghcr_semver_tags_json" --argjson b "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" '$a - $b')
+              fi
+
+              # Find tags to test - tags in origin but not in GHCR
+              if [[ $(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length') -eq 0 ]]; then
+                echo "No tags with Dockerfile detected in origin repository"
+                all_ghcr_test_tags_json="[]"
+              else
+                all_ghcr_test_tags_json=$(jq -nc --argjson a "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" --argjson b "$ghcr_semver_tags_json" '$a - $b')
+              fi
+
+              ghcr_semver_tags_after_cleanup_json=$(jq -nc --argjson tags "$ghcr_semver_tags_json" --argjson del "$ghcr_del_tags_json" '
+                [
+                  $tags[]
+                  | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                  | select(. as $tag | $del | index($tag) | not)
+                ]
+              ')
+
+              total_ghcr_semver_tags=$(echo "$ghcr_semver_tags_after_cleanup_json" | jq 'length')
+
+              ghcr_latest_tag=$(echo "$ghcr_semver_tags_after_cleanup_json" | jq -r '
+                if length == 0 then
+                  ""
+                else
+                  . | map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                  | sort_by([.major, .minor, .patch] | map(tonumber))
+                  | last
+                  | "\(.major).\(.minor).\(.patch)"
+                end
+              ')
+
+              echo "ghcr_del_tags_json: $ghcr_del_tags_json"
+              echo "all_ghcr_test_tags_json: $all_ghcr_test_tags_json"
+              echo "ghcr_semver_tags_after_cleanup_json: $ghcr_semver_tags_after_cleanup_json"
+              echo "total_ghcr_semver_tags: $total_ghcr_semver_tags"
+              echo "ghcr_latest_tag: $ghcr_latest_tag"
+
+              echo "GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON=$ghcr_semver_tags_after_cleanup_json" >> "$GITHUB_OUTPUT"
+              echo "GHCR_LATEST_TAG=$ghcr_latest_tag" >> "$GITHUB_OUTPUT"
+
+              echo "Categorizing GHCR tags..."
+              categorize_tags "$ghcr_latest_tag" "$all_ghcr_test_tags_json"
+
+              newer_tags_count=$(echo "$newer_tags_json" | jq 'length')
+              older_tags_count=$(echo "$older_tags_json" | jq 'length')
+              if ((newer_tags_count > MAX_TAGS_PER_BATCH)); then
+                ghcr_test_tags_json=$(echo "$newer_tags_json" | jq -c --arg n "${MAX_TAGS_PER_BATCH}" '.[-($n | tonumber):]')
+                echo "Limited to newest ${MAX_TAGS_PER_BATCH} tags from newer tags"
+              else
+                ghcr_test_tags_json="$newer_tags_json"
+                
+                # Only consider older tags if we're not at the total limit on GHCR
+                if ((total_ghcr_semver_tags < MAX_TOTAL_SEMVER_TAGS)); then
+                  tags_needed=$((MAX_TAGS_PER_BATCH - newer_tags_count))
+                  if ((tags_needed > 0)); then
+                    if ((older_tags_count > 0)); then
+                      echo "Adding up to $tags_needed tags from older tags"
+                      older_tags_to_add=$(echo "$older_tags_json" | jq -c --arg n "$tags_needed" '.[-($n | tonumber):]')
+                      ghcr_test_tags_json=$(echo "$older_tags_to_add" "$ghcr_test_tags_json" | jq -sc '.[0] + .[1]')
+                    fi
+                  fi
+                else
+                  echo "::warning::Already at or exceeding maximum of $MAX_TOTAL_SEMVER_TAGS total semver tags on GHCR, skipping older tags"
+                fi
+              fi
+              echo "ghcr_test_tags_json: $ghcr_test_tags_json"
+
+              echo "GHCR_META_JSON=$ghcr_meta_json" >> "$GITHUB_OUTPUT"
+              echo "GHCR_DEL_TAGS_JSON=$ghcr_del_tags_json" >> "$GITHUB_OUTPUT"
+              echo "GHCR_TEST_TAGS_JSON=$ghcr_test_tags_json" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+          # Docker Hub Analysis
+          echo "Analyzing Docker Hub tags..."
+          dh_meta_json="[]"
+          dh_del_tags_json="[]"
+          dh_test_tags_json="[]"
+          dh_semver_tags_json="[]"
+          dh_latest_tag=''
+          case "${{ steps.check-registry.outputs.DH_REPO_EXISTS }}" in
+            "false")
+              echo "Docker Hub repository does NOT exist. Running fallback tag analysis."
+              if [[ $(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length') -eq 0 ]]; then
+                echo "No tags with Dockerfile detected in origin repository."
+                dh_test_tags_json="[]"
+              else
+                origin_count=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length')
+                if (( origin_count >= MAX_TAGS_PER_BATCH )); then
+                  dh_test_tags_json=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq -c --argjson max "$MAX_TAGS_PER_BATCH" '
+                    map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                    | sort_by([.major, .minor, .patch] | map(tonumber))
+                    | .[-$max:]
+                    | map("\(.major).\(.minor).\(.patch)")
+                  ')
+                else
+                  dh_test_tags_json=$(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq -c '
+                    map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                    | sort_by([.major, .minor, .patch] | map(tonumber))
+                    | map("\(.major).\(.minor).\(.patch)")
+                  ')
+                fi
+              fi
+              echo "dh_test_tags_json: $dh_test_tags_json"
+
+              echo "DH_TEST_TAGS_JSON=$dh_test_tags_json" >> "$GITHUB_OUTPUT"
+              echo "DH_META_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "DH_DEL_TAGS_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "DH_SEMVER_TAGS_AFTER_CLEANUP_JSON=[]" >> "$GITHUB_OUTPUT"
+              echo "DH_LATEST_TAG=" >> "$GITHUB_OUTPUT"
+              ;;
+            "true")
+              max_retries=5
+              retry_count=0
+              page_number=1
+              next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/tags?page_size=100"
+              dh_results=""
+              while [[ -n "$next_url" ]]; do
+                set +e
+                response=$(curl -sL -w "%{http_code}" "$next_url")
+                curl_exit=$?
+                set -e
+                if [[ $curl_exit -eq 0 ]]; then
+                  dh_body="${response::-3}"
+                  http_code="${response: -3}"
+                  case "$http_code" in
+                    200)
+                      echo "Docker Hub repository exists. Parsing tags on Page $((page_number++))..."
+                      # Store each page result with proper line ending
+                      page_results=$(echo "$dh_body" | jq -c '.results | map(select(.content_type == "image" and (.name | 
+                        test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$") or 
+                        test("^v?[0-9]+\\.[0-9]+$") or 
+                        test("^v?[0-9]+$") or 
+                        . == "latest"
+                      ))) | map(.name |= (sub("^v"; "")))')
+                      if [[ "$page_results" != "[]" ]]; then
+                        if [[ -n "$dh_results" ]]; then
+                          dh_results=$(echo "$dh_results" "$page_results" | jq -sc 'add')
+                        else
+                          dh_results="$page_results"
+                        fi
+                      fi
+                      next_url=$(echo "$dh_body" | jq -r '.next // ""')
+                      ;;
+                    429)
+                      echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds..."
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Rate limit exceeded after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 60
+                      ;;
+                    500|502|503)
+                      echo "::warning::Docker Hub server error (HTTP $http_code). Retrying in 10 seconds..."
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Server error after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 10
+                      ;;
+                    *)
+                      echo "Unexpected HTTP status (HTTP $http_code)"
+                      exit 1
+                      ;;
+                  esac
+                else
+                  echo "::warning::Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Network or curl failure after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                fi
+              done
+
+              # Process all results into meta information
+              dh_meta_json=$(echo "$dh_results" | jq -c 'group_by(.digest) | map({ digest: .[0].digest, tags: (map(.name) | unique) })')
+              echo "dh_meta_json: $dh_meta_json"
+
+              dh_semver_tags_json=$(echo "$dh_meta_json" | jq -c '
+                [
+                  .[] | .tags[]
+                  | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                ]
+              ')
+              echo "dh_semver_tags_json: $dh_semver_tags_json"
+
+              # Find tags to delete - tags in Docker Hub but not in origin
+              if [[ "$(echo "$dh_semver_tags_json" | jq 'length')" == "0" ]]; then
+                echo "No semantic version tags detected in Docker Hub"
+                dh_del_tags_json="[]"
+              else
+                dh_del_tags_json=$(jq -nc --argjson a "$dh_semver_tags_json" --argjson b "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" '$a - $b')
+              fi
+
+              # Find tags to test - tags in origin but not in Docker Hub
+              if [[ $(echo "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" | jq 'length') -eq 0 ]]; then
+                echo "No tags with Dockerfile detected in origin repository"
+                all_dh_test_tags_json="[]"
+              else
+                all_dh_test_tags_json=$(jq -nc --argjson a "$ORIGIN_TAGS_WITH_DOCKERFILE_JSON" --argjson b "$dh_semver_tags_json" '$a - $b')
+              fi
+
+              dh_semver_tags_after_cleanup_json=$(jq -nc --argjson tags "$dh_semver_tags_json" --argjson del "$dh_del_tags_json" '
+                [
+                  $tags[]
+                  | select(. as $tag | $del | index($tag) | not)
+                ]
+              ')
+
+              total_dh_semver_tags=$(echo "$dh_semver_tags_after_cleanup_json" | jq 'length')
+
+              dh_latest_tag=$(echo "$dh_semver_tags_after_cleanup_json" | jq -r '
+                if length == 0 then
+                  ""
+                else
+                  . | map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                  | sort_by([.major, .minor, .patch] | map(tonumber))
+                  | last
+                  | "\(.major).\(.minor).\(.patch)"
+                end
+              ')
+
+              echo "dh_del_tags_json=$dh_del_tags_json"
+              echo "all_dh_test_tags_json: $all_dh_test_tags_json"
+              echo "dh_semver_tags_after_cleanup_json: $dh_semver_tags_after_cleanup_json"
+              echo "total_dh_semver_tags: $total_dh_semver_tags"
+              echo "dh_latest_tag: $dh_latest_tag"
+
+              echo "DH_SEMVER_TAGS_AFTER_CLEANUP_JSON=$dh_semver_tags_after_cleanup_json" >> "$GITHUB_OUTPUT"
+              echo "DH_LATEST_TAG=$dh_latest_tag" >> "$GITHUB_OUTPUT"
+
+              echo "Categorizing Docker Hub tags..."
+              categorize_tags "$dh_latest_tag" "$all_dh_test_tags_json"
+
+              newer_tags_count=$(echo "$newer_tags_json" | jq 'length')
+              older_tags_count=$(echo "$older_tags_json" | jq 'length')
+              if ((newer_tags_count > MAX_TAGS_PER_BATCH)); then
+                dh_test_tags_json=$(echo "$newer_tags_json" | jq -c --arg n "${MAX_TAGS_PER_BATCH}" '.[-($n | tonumber):]')
+                echo "Limited to newest ${MAX_TAGS_PER_BATCH} tags from newer tags"
+              else
+                dh_test_tags_json="$newer_tags_json"
+
+                # Only consider older tags if we're not at the total limit on Docker Hub
+                if ((total_dh_semver_tags < MAX_TOTAL_SEMVER_TAGS)); then
+                  tags_needed=$((MAX_TAGS_PER_BATCH - newer_tags_count))
+                  if ((tags_needed > 0)); then
+                    if ((older_tags_count > 0)); then
+                      echo "Adding up to $tags_needed tags from older tags"
+                      older_tags_to_add=$(echo "$older_tags_json" | jq -c --arg n "$tags_needed" '.[-($n | tonumber):]')
+                      dh_test_tags_json=$(echo "$older_tags_to_add" "$dh_test_tags_json" | jq -sc '.[0] + .[1]')
+                    fi
+                  fi
+                else
+                  echo "::warning::Already at or exceeding maximum of $MAX_TOTAL_SEMVER_TAGS total semver tags on Docker Hub, skipping older tags"
+                fi
+              fi
+              echo "dh_test_tags_json: $dh_test_tags_json"
+
+              echo "DH_META_JSON=$dh_meta_json" >> "$GITHUB_OUTPUT"
+              echo "DH_DEL_TAGS_JSON=$dh_del_tags_json" >> "$GITHUB_OUTPUT"
+              echo "DH_TEST_TAGS_JSON=$dh_test_tags_json" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+          combined_test_tags_json=$(echo "$ghcr_test_tags_json" "$dh_test_tags_json" | jq -sc 'add | unique')
+          echo "combined_test_tags_json: $combined_test_tags_json"
+          echo "COMBINED_TEST_TAGS_JSON=$combined_test_tags_json" >> "$GITHUB_OUTPUT"
+
+  test-images:
+    name: Test Docker Images
+    needs: pre-build
+    runs-on: ubuntu-latest
+    outputs:
+      JOB_GHCR_PASSED_TAG_PLATFORM_JSON: ${{ steps.test.outputs.GHCR_PASSED_TAG_PLATFORM_JSON }}
+      JOB_DH_PASSED_TAG_PLATFORM_JSON: ${{ steps.test.outputs.DH_PASSED_TAG_PLATFORM_JSON }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test Multi-arch Docker Images
+        id: test
+        env:
+          BUILDX_PLATFORMS_JSON: ${{ needs.pre-build.outputs.JOB_BUILDX_PLATFORMS_JSON }}
+          COMBINED_TEST_TAGS_JSON: ${{ needs.pre-build.outputs.JOB_COMBINED_TEST_TAGS_JSON }}
+          GHCR_TEST_TAGS_JSON: ${{ needs.pre-build.outputs.JOB_GHCR_TEST_TAGS_JSON }}
+          DH_TEST_TAGS_JSON: ${{ needs.pre-build.outputs.JOB_DH_TEST_TAGS_JSON }}
+        run: |
+          set -euo pipefail
+
+          original_state=$(git rev-parse --abbrev-ref HEAD || echo "HEAD")
+          trap 'git switch --detach "$original_state" 2>/dev/null || true' EXIT INT TERM
+
+          if [[ "$(echo "$COMBINED_TEST_TAGS_JSON" | jq 'length')" == "0" ]]; then
+            ghcr_passed_tag_platform_json="[]"
+            dh_passed_tag_platform_json="[]"
+            echo "Nothing to test."
+          else
+            passed_tag_platform_json="[]"
+            while IFS= read -r tag; do
+              echo "Testing multi-arch image for tag: $tag"
+              if git rev-parse "v$tag" >/dev/null 2>&1; then
+                git switch --detach "v$tag"
+              elif git rev-parse "$tag" >/dev/null 2>&1; then
+                git switch --detach "$tag"
+              else
+                echo "::warning::Failed to switch to tag: $tag"
+                continue
+              fi
+
+              platforms_json="[]"
+              while IFS= read -r platform; do
+                test_tag="$tag-$(echo "$platform" | tr '/' '-')-test"
+
+                echo "Building for $platform, tag: $tag..."
+                if docker buildx build --platform "$platform" --load -t "$test_tag" .; then
+                  echo "Running test for $platform, tag: $tag..."
+                  if docker run --rm "$test_tag" true; then
+                    platforms_json=$(echo "$platforms_json" | jq -c --arg p "$platform" '. + [$p]')
+                  else
+                    echo "::warning::Smoke test failed for $platform, tag: $tag"
+                  fi
+                else
+                  echo "::warning::Build failed for $platform, tag: $tag"
+                fi
+                docker rmi "$test_tag" 2>/dev/null || true
+              done < <(echo "$BUILDX_PLATFORMS_JSON" | jq -r '.[]')
+              echo "platforms_json=$platforms_json"
+
+              if [[ $(echo "$platforms_json" | jq 'length') -gt 0 ]]; then
+                passed_tag_platform_json=$(echo "$passed_tag_platform_json" | jq -c --arg tag "$tag" --argjson platforms "$platforms_json" '. + [{tag: $tag, platforms: $platforms}]')
+                echo "Tag: \"$tag\" passed test on platforms: $(echo "$platforms_json" | jq -r 'join(", ")')"
+              else
+                echo "::warning::Tag: \"$tag\" did NOT pass any platform tests and will NOT be built."
+              fi
+            done < <(echo "$COMBINED_TEST_TAGS_JSON" | jq -r '.[]')
+            echo "passed_tag_platform_json=$passed_tag_platform_json"
+
+            ghcr_passed_tag_platform_json=$(echo "$passed_tag_platform_json" | jq -c \
+              --argjson ghcr_test_tags "$GHCR_TEST_TAGS_JSON" \
+              'if $ghcr_test_tags == [] then
+                []
+              else
+                [.[] | select(.tag as $t | $ghcr_test_tags | contains([$t]))]
+              end')
+            echo "ghcr_passed_tag_platform_json=$ghcr_passed_tag_platform_json"
+
+            dh_passed_tag_platform_json=$(echo "$passed_tag_platform_json" | jq -c \
+              --argjson dh_test_tags "$DH_TEST_TAGS_JSON" \
+              'if $dh_test_tags == [] then
+                []
+              else
+                [.[] | select(.tag as $t | $dh_test_tags | contains([$t]))]
+              end')
+            echo "dh_passed_tag_platform_json=$dh_passed_tag_platform_json"
+          fi
+
+          echo "GHCR_PASSED_TAG_PLATFORM_JSON=$ghcr_passed_tag_platform_json" >> "$GITHUB_OUTPUT"
+          echo "DH_PASSED_TAG_PLATFORM_JSON=$dh_passed_tag_platform_json" >> "$GITHUB_OUTPUT"
+
+  build-and-push-ghcr:
+    name: Build & Push to GHCR
+    needs: [pre-build, test-images]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean Up Deprecated Images From GHCR
+        if: ${{ needs.pre-build.outputs.JOB_GHCR_META_JSON != '[]' && needs.pre-build.outputs.JOB_GHCR_DEL_TAGS_JSON != '[]' }}
+        env:
+          GHCR_META_JSON: ${{ needs.pre-build.outputs.JOB_GHCR_META_JSON }}
+          GHCR_DEL_TAGS_JSON: ${{ needs.pre-build.outputs.JOB_GHCR_DEL_TAGS_JSON }}
+          GHCR_LATEST_TAG: ${{ needs.pre-build.outputs.JOB_GHCR_LATEST_TAG }}
+        run: |
+          set -euo pipefail
+
+          echo "Cleaning up deprecated images from GHCR..."
+
+          for del_tag in $(echo "$GHCR_DEL_TAGS_JSON" | jq -r '.[]'); do
+            mapfile -t del_ids < <(echo "$GHCR_META_JSON" | jq -r --arg del_tag "$del_tag" '.[] | select(.tags[] == $del_tag) | .id')
+            if [[ ${#del_ids[@]} -eq 0 ]]; then
+              echo "Could not find version ID for tag: $del_tag"
+              exit 1
+            fi
+            for del_id in "${del_ids[@]}"; do
+              max_retries=5
+              retry_count=0
+              while true; do
+                set +e
+                response=$(gh api --method DELETE "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions/$del_id")
+                gh_exit=$?
+                set -e
+                if [[ $gh_exit -eq 0 ]]; then
+                  echo "Successfully deleted version ID: $del_id (tag: $del_tag)"
+                  break
+                else
+                  status=$(echo "$response" | jq -r '.status // ""')
+                  message=$(echo "$response" | jq -r '.message // ""')
+                  case "$status" in
+                    429)
+                      echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Rate limit exceeded after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 60
+                      continue
+                      ;;
+                    500|502|503)
+                      echo "::warning::GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Server error after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 10
+                      continue
+                      ;;
+                    *)
+                      echo "::error::Unexpected error:"
+                      echo "::error::$response"
+                      exit 1
+                      ;;
+                  esac
+                fi
+              done
+            done
+          done
+          echo "Tag cleanup completed for GHCR"
+
+          # Check if the 'latest' tag has been deleted and re-tag if needed
+          if echo "$GHCR_META_JSON" | jq -e --argjson del_tags "$GHCR_DEL_TAGS_JSON" '
+            .[] | select(
+              ([.tags[]] | any(. == "latest")) and
+              ([.tags[]] | any($del_tags | index(.)))
+            )
+          ' >/dev/null; then
+            if [[ -n "$GHCR_LATEST_TAG" ]]; then
+              echo "Latest tag was deleted. Re-tagging $GHCR_LATEST_TAG as latest..."
+              docker pull "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:$GHCR_LATEST_TAG"
+              docker tag "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:$GHCR_LATEST_TAG" "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:latest"
+              docker push "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:latest"
+              echo "Re-tagged $GHCR_LATEST_TAG as latest"
+            else
+              echo "No semver tags remain on GHCR after cleanup"
+            fi
+          else
+            echo "Latest tag was not affected by cleanup, no re-tagging needed"
+          fi
+
+      - name: Build and Push Images to GHCR
+        if: ${{ needs.test-images.outputs.JOB_GHCR_PASSED_TAG_PLATFORM_JSON != '[]' }}
+        env:
+          GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON: ${{ needs.pre-build.outputs.JOB_GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON }}
+          GHCR_PASSED_TAG_PLATFORM_JSON: ${{ needs.test-images.outputs.JOB_GHCR_PASSED_TAG_PLATFORM_JSON }}
+        run: |
+          set -euo pipefail
+
+          # Store original git state and ensure we return to it
+          original_state=$(git rev-parse --abbrev-ref HEAD || echo "HEAD")
+          trap 'git switch --detach "$original_state" 2>/dev/null || true' EXIT INT TERM
+
+          echo "Starting GHCR build and push process..."
+          echo "Number of tags to process: $(echo "$GHCR_PASSED_TAG_PLATFORM_JSON" | jq length)"
+
+          jq_derive_tags='
+            def to_parts:
+              capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$") |
+              {major: (.major|tonumber), minor: (.minor|tonumber), patch: (.patch|tonumber)};
+
+            def is_latest_version($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts)) as $versions |
+              $versions | all(
+                $current_version.major > .major or
+                ($current_version.major == .major and $current_version.minor > .minor) or
+                ($current_version.major == .major and $current_version.minor == .minor and $current_version.patch >= .patch)
+              );
+
+            def is_latest_for_major($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts) | map(select(.major == $current_version.major))) as $same_major |
+              $same_major | all(
+                $current_version.minor > .minor or
+                ($current_version.minor == .minor and $current_version.patch >= .patch)
+              );
+
+            def is_latest_for_minor($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts) | map(select(.major == $current_version.major and .minor == $current_version.minor))) as $same_minor |
+              $same_minor | all($current_version.patch >= .patch);
+
+            def derive_tags($all_tags):
+              . as $tag |
+              capture("^(?<prefix>v?)(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$") as $version |
+              [
+                if ($tag | is_latest_version($all_tags)) then "latest" else empty end,
+                if ($tag | is_latest_for_minor($all_tags)) then "\($version.prefix)\($version.major).\($version.minor)" else empty end,
+                if ($tag | is_latest_for_major($all_tags)) then "\($version.prefix)\($version.major)" else empty end
+              ] | map(select(type == "string" and (length > 0)));
+
+            . | derive_tags($a + ($b | map(.tag)))
+          '
+
+          # Process each tag and its supported platform(s)
+          while read -r tag platforms; do
+            echo "Building multi-arch image for tag: $tag"
+            checked_out_tag=""
+            if git rev-parse "v$tag" >/dev/null 2>&1; then
+              git switch --detach "v$tag"
+              checked_out_tag="v$tag"
+            elif git rev-parse "$tag" >/dev/null 2>&1; then
+              git switch --detach "$tag"
+              checked_out_tag="$tag"
+            else
+              echo "Failed to switch to tag: $tag"
+              exit 1
+            fi
+
+            build_args=(
+              # OCI labels (affecting the image digest)
+              --label "org.opencontainers.image.title=$ORIGIN_REPO_NAME"
+              --label "org.opencontainers.image.version=$checked_out_tag"
+              --label "org.opencontainers.image.created=$(git log -1 --format=%aI "$checked_out_tag")"
+              --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.JOB_UPSTREAM_CONTRIBUTORS }}"
+              --label "org.opencontainers.image.revision=$(git rev-parse "$checked_out_tag")"
+            
+              # OCI annotations (NOT affecting the image digest)
+              --annotation "org.opencontainers.image.description=Docker image built from $ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL"
+              --annotation "org.opencontainers.image.documentation=$ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL/docs"
+              --annotation "org.opencontainers.image.source=$ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL"
+              --annotation "org.opencontainers.image.url=https://github.com/$ORIGIN_OWNER/$ORIGIN_REPO_NAME/packages"
+
+              # Build configuration (NOT affecting the image digest)
+              --platform "$platforms"
+              --push
+              --tag "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:$tag"
+            )
+
+            # Add optional labels
+            if [[ -n "${{ needs.pre-build.outputs.JOB_UPSTREAM_LICENSE }}" ]]; then
+              build_args+=(--label "org.opencontainers.image.licenses=${{ needs.pre-build.outputs.JOB_UPSTREAM_LICENSE }}")
+            fi
+
+            # Process tag information for shorthand and latest tags
+            echo "Deriving additional tags for: $tag"
+            derived_tags=$(echo "$tag" | jq -R \
+              --argjson a "$GHCR_SEMVER_TAGS_AFTER_CLEANUP_JSON" \
+              --argjson b "$GHCR_PASSED_TAG_PLATFORM_JSON" \
+              "$jq_derive_tags")
+            echo "derived_tags=$derived_tags"
+
+            # Add additional tags
+            if [[ "$(echo "$derived_tags" | jq 'length')" -gt 0 ]]; then
+              while read -r additional_tag; do
+                if [[ -n "$additional_tag" ]]; then
+                  build_args+=(--tag "ghcr.io/$ORIGIN_OWNER/$ORIGIN_REPO_NAME:$additional_tag")
+                fi
+              done < <(echo "$derived_tags" | jq -r '.[]')
+            fi
+
+            # Execute build
+            echo "Building and pushing multi-arch image: $tag [$platforms] → GHCR"
+            if ! docker buildx build "${build_args[@]}" .; then
+              echo "::error::Failed to build/push for tag: $tag"
+              exit 1
+            fi
+            echo "Successfully built and pushed multi-arch image to GHCR for tag: $tag"
+          done < <(echo "$GHCR_PASSED_TAG_PLATFORM_JSON" | jq -r '.[] | "\(.tag) \(.platforms | join(","))"')
+
+  build-and-push-dockerhub:
+    name: Build & Push to Docker Hub
+    needs: [pre-build, test-images]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DH_USERNAME }}
+          password: ${{ secrets.DH_PAT }}
+
+      - name: Clean Up Deprecated Images From Docker Hub
+        if: ${{ needs.pre-build.outputs.JOB_DH_META_JSON != '[]' && needs.pre-build.outputs.JOB_DH_DEL_TAGS_JSON != '[]' }}
+        env:
+          DH_META_JSON: ${{ needs.pre-build.outputs.JOB_DH_META_JSON }}
+          DH_DEL_TAGS_JSON: ${{ needs.pre-build.outputs.JOB_DH_DEL_TAGS_JSON }}
+          DH_LATEST_TAG: ${{ needs.pre-build.outputs.JOB_DH_LATEST_TAG }}
+        run: |
+          set -euo pipefail
+
+          echo "Cleaning up deprecated images from Docker Hub..."
+
+          dh_del_digest_tag_json=$(echo "$DH_META_JSON" | jq -c --argjson del_tags "$DH_DEL_TAGS_JSON" '
+            [
+              .[] | select(.tags[] | . as $t | $del_tags | index($t))
+            ]
+          ')
+          echo "dh_del_digest_tag_json: $dh_del_digest_tag_json"
+
+          for del_tag in $(echo "$dh_del_digest_tag_json" | jq -r '.[]'); do
+            max_retries=5
+            retry_count=0
+            while true; do
+              set +e
+              http_code=$(curl -sL -u "$DH_OWNER:$DH_PAT" -o /dev/null -w "%{http_code}" -X DELETE \
+                "https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/tags/$del_tag/")
+              curl_exit=$?
+              set -e
+              if [[ $curl_exit -eq 0 ]]; then
+                case "$http_code" in
+                  200|202|204)
+                    echo "Successfully deleted tag: $del_tag"
+                    break
+                    ;;
+                  401|403)
+                    echo "::error::Unauthorized or forbidden (HTTP $http_code). Check your Docker Hub credentials and permissions."
+                    exit 1
+                    ;;
+                  409)
+                    echo "::warning::Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    ((retry_count++))
+                    if ((retry_count >= max_retries)); then
+                      echo "::error::Conflict (HTTP 409) after $retry_count attempts Giving up."
+                      exit 1
+                    fi
+                    sleep 10
+                    ;;
+                  429)
+                    echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    ((retry_count++))
+                    if ((retry_count >= max_retries)); then
+                      echo "Rate limit exceeded after $retry_count attempts"
+                      exit 1
+                    fi
+                    sleep 60
+                    ;;
+                  500|502|503)
+                    echo "::warning::Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    ((retry_count++))
+                    if ((retry_count >= max_retries)); then
+                      echo "::error::Server error after $retry_count attempts"
+                      exit 1
+                    fi
+                    sleep 10
+                    ;;
+                  *)
+                    echo "::error::Unexpected HTTP status (HTTP $http_code)."
+                    exit 1
+                    ;;
+                esac
+              else
+                echo "::warning::Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                ((retry_count++))
+                if ((retry_count >= max_retries)); then
+                  echo "::error::Network or curl failure after $retry_count attempts"
+                  exit 1
+                fi
+                sleep 10
+              fi
+            done
+          done
+          echo "Tag cleanup completed for Docker Hub"
+
+          latest_deleted=false
+          for del_tag in $(echo "$dh_del_digest_tag_json" | jq -r '.[] | .tags[]'); do
+            if [[ "$del_tag" == "latest" ]]; then
+              latest_deleted=true
+              break
+            fi
+          done
+
+          if [[ "$latest_deleted" == "true" ]]; then
+            echo "Re-tagging the new latest tag for Docker Hub..."
+            if [[ -n "$DH_LATEST_TAG" ]]; then
+              # Find the digest for DH_LATEST_TAG
+              new_latest_digest=$(echo "$DH_META_JSON" | jq -r --arg tag "$DH_LATEST_TAG" '
+                .[] | select(.tags[] | . == $tag) | .digest
+              ')
+              echo "Re-tagging $DH_LATEST_TAG (digest: $new_latest_digest) as 'latest'..."
+              max_retries=5
+              retry_count=0
+              while true; do
+                set +e
+                response=$(curl -sL -o /dev/null -w "%{http_code}" -X POST \
+                  -u "$DH_OWNER:$DH_PAT" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"source_digest\": \"$new_latest_digest\"}" \
+                  "https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/tags/latest/")
+                curl_exit=$?
+                set -e
+                if [[ $curl_exit -eq 0 ]]; then
+                  case "$response" in
+                    200|201|202)
+                      echo "Successfully re-tagged $DH_LATEST_TAG (digest: $new_latest_digest) as 'latest'"
+                      break
+                      ;;
+                    401|403)
+                      echo "::error::Unauthorized or forbidden (HTTP $response). Check your Docker Hub credentials and permissions."
+                      exit 1
+                      ;;
+                    409)
+                      echo "::warning::Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Conflict (HTTP 409) after $retry_count attempts Giving up."
+                        exit 1
+                      fi
+                      sleep 10
+                      ;;
+                    429)
+                      echo "::warning::Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Rate limit exceeded after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 60
+                      ;;
+                    500|502|503)
+                      echo "::warning::Docker Hub server error (HTTP $response). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "::error::Server error after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 10
+                      ;;
+                    *)
+                      echo "::error::Unexpected HTTP status (HTTP $response)."
+                      exit 1
+                      ;;
+                  esac
+                else
+                  echo "::warning::Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  ((retry_count++))
+                  if ((retry_count >= max_retries)); then
+                    echo "::error::Network or curl failure after $retry_count attempts"
+                    exit 1
+                  fi
+                  sleep 10
+                fi
+              done
+            else
+              echo "No semver tags remain on Docker Hub after cleanup"
+            fi
+          else
+            echo "Latest tag was not affected by cleanup, no re-tagging needed"
+          fi
+
+      - name: Build and Push Images to Docker Hub
+        if: ${{ needs.test-images.outputs.JOB_DH_PASSED_TAG_PLATFORM_JSON != '[]' }}
+        env:
+          DH_SEMVER_TAGS_AFTER_CLEANUP_JSON: ${{ needs.pre-build.outputs.JOB_DH_SEMVER_TAGS_AFTER_CLEANUP_JSON }}
+          DH_PASSED_TAG_PLATFORM_JSON: ${{ needs.test-images.outputs.JOB_DH_PASSED_TAG_PLATFORM_JSON }}
+        run: |
+          set -euo pipefail
+
+          # Store original git state and ensure we return to it
+          original_state=$(git rev-parse --abbrev-ref HEAD || echo "HEAD")
+          trap 'git switch --detach "$original_state" 2>/dev/null || true' EXIT INT TERM
+
+          echo "Starting Docker Hub build and push process..."
+          echo "Number of tags to process: $(echo "$DH_PASSED_TAG_PLATFORM_JSON" | jq length)"
+
+          jq_derive_tags='
+            def to_parts:
+              capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$") |
+              {major: (.major|tonumber), minor: (.minor|tonumber), patch: (.patch|tonumber)};
+
+            def is_latest_version($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts)) as $versions |
+              $versions | all(
+                $current_version.major > .major or
+                ($current_version.major == .major and $current_version.minor > .minor) or
+                ($current_version.major == .major and $current_version.minor == .minor and $current_version.patch >= .patch)
+              );
+
+            def is_latest_for_major($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts) | map(select(.major == $current_version.major))) as $same_major |
+              $same_major | all(
+                $current_version.minor > .minor or
+                ($current_version.minor == .minor and $current_version.patch >= .patch)
+              );
+
+            def is_latest_for_minor($all_tags):
+              . as $current_tag |
+              ($current_tag | to_parts) as $current_version |
+              ($all_tags | map(to_parts) | map(select(.major == $current_version.major and .minor == $current_version.minor))) as $same_minor |
+              $same_minor | all($current_version.patch >= .patch);
+
+            def derive_tags($all_tags):
+              . as $tag |
+              capture("^(?<prefix>v?)(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$") as $version |
+              [
+                if ($tag | is_latest_version($all_tags)) then "latest" else empty end,
+                if ($tag | is_latest_for_minor($all_tags)) then "\($version.prefix)\($version.major).\($version.minor)" else empty end,
+                if ($tag | is_latest_for_major($all_tags)) then "\($version.prefix)\($version.major)" else empty end
+              ] | map(select(type == "string" and (length > 0)));
+
+            . | derive_tags($a + ($b | map(.tag)))
+          '
+
+          # Process each tag and its supported platform(s)
+          while read -r tag platforms; do
+            echo "Building multi-arch image for tag: $tag"
+            checked_out_tag=""
+            if git rev-parse "v$tag" >/dev/null 2>&1; then
+              git switch --detach "v$tag"
+              checked_out_tag="v$tag"
+            elif git rev-parse "$tag" >/dev/null 2>&1; then
+              git switch --detach "$tag"
+              checked_out_tag="$tag"
+            else
+              echo "Failed to switch to tag: $tag"
+              exit 1
+            fi
+
+            build_args=(
+              # OCI labels (affecting the image digest)
+              --label "org.opencontainers.image.title=$ORIGIN_REPO_NAME"
+              --label "org.opencontainers.image.version=$checked_out_tag"
+              --label "org.opencontainers.image.created=$(git log -1 --format=%aI "$checked_out_tag")"
+              --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.JOB_UPSTREAM_CONTRIBUTORS }}"
+              --label "org.opencontainers.image.revision=$(git rev-parse "$checked_out_tag")"
+            
+              # OCI annotations (NOT affecting the image digest)
+              --annotation "org.opencontainers.image.description=Docker image built from $ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL"
+              --annotation "org.opencontainers.image.documentation=$ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL/docs"
+              --annotation "org.opencontainers.image.source=$ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL"
+              --annotation "org.opencontainers.image.url=https://hub.docker.com/r/$DH_OWNER/$ORIGIN_REPO_NAME"
+
+              # Build configuration (NOT affecting the image digest)
+              --platform "$platforms"
+              --push
+              --tag "$DH_OWNER/$ORIGIN_REPO_NAME:$tag"
+            )
+
+            # Add optional labels
+            if [[ -n "${{ needs.pre-build.outputs.JOB_UPSTREAM_LICENSE }}" ]]; then
+              build_args+=(--label "org.opencontainers.image.licenses=${{ needs.pre-build.outputs.JOB_UPSTREAM_LICENSE }}")
+            fi
+
+            # Process tag information for shorthand and latest tags
+            echo "Deriving additional tags for: $tag"
+            derived_tags=$(echo "$tag" | jq -R \
+              --argjson a "$DH_SEMVER_TAGS_AFTER_CLEANUP_JSON" \
+              --argjson b "$DH_PASSED_TAG_PLATFORM_JSON" \
+              "$jq_derive_tags")
+            echo "derived_tags=$derived_tags"
+
+            # Add additional tags
+            if [[ "$(echo "$derived_tags" | jq 'length')" -gt 0 ]]; then
+              while read -r additional_tag; do
+                if [[ -n "$additional_tag" ]]; then
+                build_args+=(--tag "$DH_OWNER/$ORIGIN_REPO_NAME:$additional_tag")
+                fi
+              done < <(echo "$derived_tags" | jq -r '.[]')
+            fi
+
+            # Execute build
+            echo "Building and pushing multi-arch image: $tag [$platforms] → Docker Hub"
+            if ! docker buildx build "${build_args[@]}" .; then
+              echo "::error::Failed to build/push for tag: $tag"
+              exit 1
+            fi
+            echo "Successfully built and pushed multi-arch image to Docker Hub for tag: $tag"
+          done < <(echo "$DH_PASSED_TAG_PLATFORM_JSON" | jq -r '.[] | "\(.tag) \(.platforms | join(","))"')

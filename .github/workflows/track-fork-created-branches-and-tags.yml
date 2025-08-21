@@ -1,0 +1,242 @@
+name: Track Fork-Created Branches and Tags
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+
+concurrency:
+  group: track-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  METADATA_DIR_BASENAME: .github/sync-metadata-
+  FORK_CREATED_BRANCHES: fork-created-branches.json
+  FORK_CREATED_TAGS: fork-created-tags.json
+
+jobs:
+  track-fork-metadata:
+    if: ${{ github.actor == github.repository_owner && github.event.pusher.name == github.repository_owner }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect or Create Metadata Directory
+        id: detect-metadata-dir
+        run: |
+          set -euo pipefail
+
+          candidates=($(find .github -maxdepth 1 -type d -name "sync-metadata-*"))
+          keep_dir=""
+          keep_candidates=()
+          empty_dirs=()
+          for dir in "${candidates[@]}"; do
+            for file in "$FORK_CREATED_BRANCHES" "$FORK_CREATED_TAGS"; do
+              if [[ -f "$dir/$file" ]]; then
+                mtime=$(stat -c %Y "$dir/$file")
+                keep_candidates+=("$dir:$file:$mtime")
+              fi
+            done
+            if [[ -z $(ls -A "$dir") ]]; then
+              empty_dirs+=("$dir")
+            fi
+          done
+          if [[ ${#keep_candidates[@]} -gt 1 ]]; then
+            latest_dir=""
+            latest_time=0
+            for entry in "${keep_candidates[@]}"; do
+              dir_name="${entry%%:*}"
+              mtime="${entry##*:}"
+              if (( mtime > latest_time )); then
+                latest_time=$mtime
+                latest_dir=$dir_name
+              fi
+            done
+            keep_dir="$latest_dir"
+          elif [[ ${#keep_candidates[@]} -eq 1 ]]; then
+            keep_dir="${keep_candidates[0]%%:*}"
+          elif [[ ${#empty_dirs[@]} -gt 0 ]]; then
+            latest_dir=""
+            latest_time=0
+            for dir in "${empty_dirs[@]}"; do
+              ctime=$(stat -c %W "$dir" 2>/dev/null || stat -c %Y "$dir")
+              if (( ctime > latest_time )); then
+                latest_time=$ctime
+                latest_dir=$dir
+              fi
+            done
+            keep_dir="$latest_dir"
+          fi
+
+          for dir in "${candidates[@]}"; do
+            if [[ "$dir" != "$keep_dir" ]]; then
+              rm -rf "$dir"
+              echo "Removed orphaned metadata dir: $dir"
+            fi
+          done
+          if [[ -n "$keep_dir" ]]; then
+            metadata_dir="$keep_dir"
+            echo "Detected existing metadata_dir: $metadata_dir"
+          else
+            timestamp=$(date +%Y%m%d-%H%M%S)
+            metadata_dir="${METADATA_DIR_BASENAME}${timestamp}"
+            mkdir -p "$metadata_dir"
+            echo "Created new metadata_dir: $metadata_dir"
+          fi
+          echo "METADATA_DIR=$metadata_dir" >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Ref Type, Name
+        id: detect-ref
+        run: |
+          case "${GITHUB_REF}" in
+            refs/heads/*)
+              echo "REF_TYPE=branch" >> "$GITHUB_ENV"
+              echo "REF_NAME=${GITHUB_REF#refs/heads/}" >> "$GITHUB_ENV"
+              ;;
+            refs/tags/*)
+              echo "REF_TYPE=tag" >> "$GITHUB_ENV"
+              echo "REF_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Get Parent Repository
+        id: parent-repo
+        env:
+          REPO_JSON: ${{ toJson(github.event.repository) }}
+        run: |
+          if [[ "${{ github.event.repository.fork }}" == "true" ]]; then
+            parent_repo=$(echo "$REPO_JSON" | jq -r '.parent.full_name // ""')
+            echo "PARENT_REPO=$parent_repo" >> "$GITHUB_ENV"
+          else
+            echo "PARENT_REPO=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update Tracking Files
+        id: update-tracking
+        run: |
+          set -euo pipefail
+
+          fork_created_branches_file="$METADATA_DIR/$FORK_CREATED_BRANCHES"
+          fork_created_tags_file="$METADATA_DIR/$FORK_CREATED_TAGS"
+
+          case "$REF_TYPE" in
+            branch)
+              if [[ ! -s "$fork_created_branches_file" ]]; then
+                echo '[]' > "$fork_created_branches_file"
+              fi
+
+              branch_name="$REF_NAME"
+              branch_hash=$(git rev-parse "$REF_NAME")
+              branch_date=$(git show -s --format=%ci "$branch_hash")
+              branch_author=$(git show -s --format='%an <%ae>' "$branch_hash")
+              new_entry=$(jq -nc \
+                --arg name "$branch_name" \
+                --arg date "$branch_date" \
+                --arg author "$branch_author" \
+                '{"name": $name, "date": $date, "author": $author}')
+
+              # Check for upstream branch collision and auto-rename if needed
+              if [[ -n "$PARENT_REPO" ]]; then
+                git remote add upstream "https://github.com/$PARENT_REPO.git"
+                git fetch upstream
+                if git branch -r | grep -Fq "upstream/$branch_name"; then
+                  timestamp=$(date +%Y%m%d%H%M%S)
+                  if [[ "$branch_name" == fork-* ]]; then
+                    new_branch_name="${branch_name}-${timestamp}"
+                  else
+                    new_branch_name="fork-${branch_name}-${timestamp}"
+                  fi
+                  echo "::warning::Branch '$branch_name' already exists in upstream. Auto-renaming to '$new_branch_name'."
+                  branch_name="$new_branch_name"
+                fi
+              fi
+
+              new_entry=$(jq -nc \
+                --arg name "$branch_name" \
+                --arg date "$branch_date" \
+                --arg author "$branch_author" \
+                '{"name": $name, "date": $date, "author": $author}')
+
+              if ! jq -e --arg name "$branch_name" '.[] | select($name == .name)' "$fork_created_branches_file" > /dev/null; then
+                jq --argjson entry "$new_entry" '. += [$entry]' "$fork_created_branches_file" > "${fork_created_branches_file}.tmp"
+                mv "${fork_created_branches_file}.tmp" "$fork_created_branches_file"
+                echo "FILE_UPDATED=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "Branch entry already recorded."
+                echo "FILE_UPDATED=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            
+            tag)
+              if [[ ! -s "$fork_created_tags_file" ]]; then
+                echo '[]' > "$fork_created_tags_file"
+              fi
+
+              tag_name="$REF_NAME"
+              tag_hash=$(git rev-parse "refs/tags/$tag_name^{commit}")
+              tag_date=$(git show -s --format=%ci "$tag_hash")
+              tag_author=$(git show -s --format='%an <%ae>' "$tag_hash")
+
+              # Check for upstream tag collision and auto-rename if needed
+              if git tag -l | grep -Fxq "$tag_name"; then
+                timestamp=$(date +%Y%m%d%H%M%S)
+                if [[ "$tag_name" == fork-* ]]; then
+                  new_tag_name="${tag_name}-${timestamp}"
+                else
+                  new_tag_name="fork-${tag_name}-${timestamp}"
+                fi
+                echo "::warning::Tag '$tag_name' already exists in upstream. Auto-renaming to '$new_tag_name'."
+                git tag "$new_tag_name" "$tag_hash"
+                git tag -d "$tag_name"
+                tag_name="$new_tag_name"
+                git push origin ":refs/tags/$REF_NAME" "refs/tags/$new_tag_name"
+              fi
+              fi
+
+              new_entry=$(jq -nc \
+                --arg name "$tag_name" \
+                --arg date "$tag_date" \
+                --arg author "$tag_author" \
+                '{"name": $name, "date": $date, "author": $author}')
+
+              if ! jq -e --arg name "$tag_name" '.[] | select($name == .name)' "$fork_created_tags_file" > /dev/null; then
+                jq --argjson entry "$new_entry" '. += [$entry]' "$fork_created_tags_file" > "${fork_created_tags_file}.tmp"
+                mv "${fork_created_tags_file}.tmp" "$fork_created_tags_file"
+                echo "FILE_UPDATED=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "Tag entry already recorded."
+                echo "FILE_UPDATED=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            
+            *)
+              echo "Unknown ref type: $REF_TYPE"
+              echo "FILE_UPDATED=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Commit and Push Tracking Changes
+        if: ${{ steps.update-tracking.outputs.FILE_UPDATED == 'true' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          find "$METADATA_DIR" -type f -name 'fork-created-*.json' -exec git add {} +
+
+          if ! git diff --staged --quiet; then
+            git commit -m "Chore: track fork-created ref: ${REF_NAME} (${REF_TYPE})"
+            git push origin HEAD:${REF_NAME}
+          else
+            echo "Nothing to commit"
+          fi

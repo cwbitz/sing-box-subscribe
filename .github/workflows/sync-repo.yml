@@ -1,0 +1,272 @@
+name: Sync Repo
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-repo-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  WORKFLOW_DIR: .github/workflows
+
+jobs:
+  collect-metadata:
+    name: Collect Repository Metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      JOB_IS_FORK: ${{ steps.collect-repo-metadata.outputs.IS_FORK }} 
+      JOB_UPSTREAM_FULL_NAME: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_FULL_NAME }}
+      JOB_UPSTREAM_URL: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_URL }}
+      JOB_UPSTREAM_DEFAULT_BRANCH: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_DEFAULT_BRANCH }}
+    steps:
+      - name: Collect Upstream and Origin Repository Metadata
+        id: collect-repo-metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching repository metadata via Github API..."
+          response=$(curl -sf -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}")
+          if echo "$response" | jq -e '.fork == true' > /dev/null; then
+            echo "This repository is a fork. Fetching metadata..."
+            upstream_full_name=$(echo "$response" | jq -re '.parent.full_name')
+            upstream_url=$(echo "$response" | jq -re '.parent.clone_url')
+            upstream_default_branch=$(echo "$response" | jq -re '.parent.default_branch')
+
+            echo "upstream_full_name=$upstream_full_name"
+            echo "upstream_url=$upstream_url"
+            echo "upstream_default_branch=$upstream_default_branch"
+
+            echo "IS_FORK=true" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_FULL_NAME=$upstream_full_name" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_URL=$upstream_url" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_DEFAULT_BRANCH=$upstream_default_branch" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::This repository is not a fork."
+          fi
+        
+  sync-fork:
+    if: ${{ needs.collect-metadata.outputs.JOB_IS_FORK == 'true' }}
+    name: Sync Forked Repository
+    runs-on: ubuntu-latest
+    needs: [collect-metadata]
+    permissions:
+      contents: write
+    env:
+      FORK_CREATED_BRANCHES: fork-created-branches.json
+      FORK_CREATED_TAGS: fork-created-tags.json
+    outputs:
+      JOB_ORIGIN_TAGS_WITH_DOCKERFILE_JSON: ${{ steps.sync.outputs.ORIGIN_TAGS_WITH_DOCKERFILE_JSON }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Configure Git
+        env:
+          UPSTREAM_URL: ${{ needs.collect-metadata.outputs.JOB_UPSTREAM_URL }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          if ! git remote get-url upstream &> /dev/null; then
+            git remote add upstream "$UPSTREAM_URL"
+          else
+            git remote set-url upstream "$UPSTREAM_URL"
+          fi
+      
+      - name: Sync Branches and Tags
+        id: sync
+        env:
+          UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.JOB_UPSTREAM_DEFAULT_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          git fetch upstream --tags
+          git fetch origin --tags
+
+          METADATA_DIR=$(find .github -maxdepth 1 -type d -name 'sync-metadata-*')
+          if [[ -z "$METADATA_DIR" ]]; then
+            echo "::warning::No METADATA_DIR found. Branch/tag tracking will be skipped."
+            fork_created_branches_file=""
+            fork_created_tags_file=""
+          else
+            echo "METADATA_DIR: $METADATA_DIR"
+            fork_created_branches_file="$METADATA_DIR/$FORK_CREATED_BRANCHES"
+            fork_created_tags_file="$METADATA_DIR/$FORK_CREATED_TAGS"
+          fi
+
+          if [[ -d "$WORKFLOW_DIR" ]]; then
+            echo "Stashing $WORKFLOW_DIR..."
+            touch "$WORKFLOW_DIR/.stash-keep"
+            workflow_stash_msg="pre-sync-workflow-$(date +%s)"
+            git stash push -u --message "$workflow_stash_msg" -- "$WORKFLOW_DIR"
+            git reset HEAD "$WORKFLOW_DIR/.stash-keep"
+            rm -f "$WORKFLOW_DIR/.stash-keep"
+            echo "$WORKFLOW_DIR stashed."
+            git stash list
+          fi
+          if [[ -n "$METADATA_DIR" && -d "$METADATA_DIR" ]]; then
+            echo "Stashing $METADATA_DIR..."
+            touch "$METADATA_DIR/.stash-keep"
+            metadata_stash_msg="pre-sync-metadata-$(date +%s)"
+            git stash push -u --message "$metadata_stash_msg" -- "$METADATA_DIR"
+            git reset HEAD "$METADATA_DIR/.stash-keep"
+            rm -f "$METADATA_DIR/.stash-keep"
+            echo "$METADATA_DIR stashed."
+            git stash list
+          fi
+
+          # Processing Branches
+          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/)
+          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+          if [[ -n "$fork_created_branches_file" && -s "$fork_created_branches_file" ]]; then
+            mapfile -t fork_branches < <(jq -r '.[].name' "$fork_created_branches_file")
+          else
+            fork_branches=()
+          fi
+
+          is_fork_created_branch() {
+            local branch=$1
+            for fork_branch in "${fork_branches[@]}"; do
+              [[ -z "$fork_branch" ]] && continue
+              [[ "$branch" == "$fork_branch" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Clean up upstream-deleted branches from origin repo..."
+          for origin_branch in "${origin_branches[@]}"; do
+            if ! printf '%s\n' "${upstream_branches[@]}" | grep -Fxq "$origin_branch"; then
+              if is_fork_created_branch "$origin_branch"; then
+                echo "Skipping fork-created branch $origin_branch..."
+              else
+                git push origin --delete "$origin_branch"
+                echo "Branch $origin_branch cleaned up from origin repo..."
+              fi
+            fi
+          done
+
+          echo "Syncing branches with upstream repo..."
+          for upstream_branch in "${upstream_branches[@]}"; do
+            git checkout "$upstream_branch" 2>/dev/null || git checkout -b "$upstream_branch" "upstream/$upstream_branch"
+            git merge --no-commit --no-ff "upstream/$upstream_branch"
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "Sync: merge changes from upstream/$upstream_branch into $upstream_branch in fork"
+              git push origin "$upstream_branch"
+            fi
+          done
+
+          if [[ -n "$UPSTREAM_DEFAULT_BRANCH" ]]; then
+            echo "Switching to default branch: $UPSTREAM_DEFAULT_BRANCH before stash pop..."
+            git checkout "$UPSTREAM_DEFAULT_BRANCH"
+          fi
+
+          echo "Checking for stashed $WORKFLOW_DIR..."
+          if [[ -n "$workflow_stash_msg" ]]; then
+            workflow_stash_ref=$(git log -g --oneline refs/stash | grep "$workflow_stash_msg" | head -n1 | awk '{print $2}' | sed 's/:$//')
+            if [[ -n "$workflow_stash_ref" ]]; then
+              echo "Restoring stashed $WORKFLOW_DIR..."
+              git stash pop "$workflow_stash_ref"
+            else
+              echo "No matching stash found for $WORKFLOW_DIR."
+            fi
+          fi
+          if [[ -n "$METADATA_DIR" && -n "$metadata_stash_msg" ]]; then
+            echo "Checking for stashed $METADATA_DIR..."
+            metadata_stash_ref=$(git log -g --oneline refs/stash | grep "$metadata_stash_msg" | head -n1 | awk '{print $2}' | sed 's/:$//')
+            if [[ -n "$metadata_stash_ref" ]]; then
+              echo "Restoring stashed $METADATA_DIR..."
+              git stash pop "$metadata_stash_ref"
+            else
+              echo "No matching stash found for $METADATA_DIR."
+            fi
+          fi
+
+          git add "$WORKFLOW_DIR"
+          if [[ -n "$METADATA_DIR" && -d "$METADATA_DIR" ]]; then
+            git add "$METADATA_DIR"
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "Restore workflow/metadata directories"
+          fi
+
+          # Processing tags
+          mapfile -t upstream_tags < <(git tag -l --sort=creatordate)
+          mapfile -t origin_tags < <(git tag -l --sort=creatordate)
+          if [[ -n "$fork_created_tags_file" && -s "$fork_created_tags_file" ]]; then
+            mapfile -t fork_tags < <(jq -r '.[].name' "$fork_created_tags_file")
+          else
+            fork_tags=()
+          fi
+
+          is_fork_created_tag() {
+            local tag=$1
+            for fork_tag in "${fork_tags[@]}"; do
+              [[ -z "$fork_tag" ]] && continue
+              [[ "$tag" == "$fork_tag" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Clean up upstream-deleted tags from origin repo..."
+          for origin_tag in "${origin_tags[@]}"; do
+            if ! printf '%s\n' "${upstream_tags[@]}" | grep -Fxq "$origin_tag"; then
+              if is_fork_created_tag "$origin_tag"; then
+                echo "Skipping fork-created tag $origin_tag..."
+              else
+                echo "Deleting tag $origin_tag from origin repo..."
+                git push origin --delete "refs/tags/$origin_tag"
+              fi
+            fi
+          done
+
+          echo "Syncing tags with upstream repo..."
+          for upstream_tag in "${upstream_tags[@]}"; do
+            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$upstream_tag"; then
+              echo "Pushing upstream tag $upstream_tag to origin repo..."
+              git push origin "$upstream_tag"
+            fi
+          done
+
+          origin_tags_with_dockerfile=()
+          while read tag; do
+            if git show "$tag:Dockerfile" &>/dev/null; then
+              origin_tags_with_dockerfile+=("$tag")
+            fi
+          done < <(git tag -l | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$')
+
+          origin_tags_with_dockerfile_json=$(printf '%s\n' "${origin_tags_with_dockerfile[@]}" | \
+            jq -Rcs '
+              split("\n")
+                | map(capture("^v?(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$"))
+                | sort_by([.major, .minor, .patch] | map(tonumber))
+                | map("\(.major).\(.minor).\(.patch)")
+              ')
+          echo "origin_tags_with_dockerfile_json=$origin_tags_with_dockerfile_json"
+          echo "ORIGIN_TAGS_WITH_DOCKERFILE_JSON=$origin_tags_with_dockerfile_json" >> "$GITHUB_OUTPUT"
+
+  test-build-push-docker-images:
+    name: Test, Build & Push Docker Images to Registries
+    needs: [collect-metadata, sync-fork]
+    uses: ./.github/workflows/test-build-push-docker-images.yml
+    with:
+      upstream_full_name: ${{ needs.collect-metadata.outputs.JOB_UPSTREAM_FULL_NAME }}
+      origin_tags_with_dockerfile_json: ${{ needs.sync-fork.outputs.JOB_ORIGIN_TAGS_WITH_DOCKERFILE_JSON }}
+    secrets:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      DH_PAT: ${{ secrets.DH_PAT }}
